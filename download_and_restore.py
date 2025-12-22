@@ -18,7 +18,7 @@ def download_and_restore_pacs(cache_dir = './datasets_cache', save_dir = './myda
             if item['domain'] == domain_name[j]:
                 d_name = domain_name[j]
 
-        target_dir = os.path.join(save_dir, d_name, label_name)
+        target_dir = os.path.join(save_dir, d_name, l_name)
         if not os.path.exists(target_dir):
             os.makedirs(target_dir)
 

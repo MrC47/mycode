@@ -64,7 +64,14 @@ def get_algorithm_class(algorithm_name):
     if algorithm_name not in globals():
         raise NotImplementedError("Algorithm not found: {}".format(algorithm_name))
     return globals()[algorithm_name]
-
+# 涉及模型的相关类，要继承torch.nn.Module
+# 如果你不继承它，你的类就是一个普通的Python对象。继承了它，它就变成了一个能与GPU、优化器和自动微分引擎（Autograd）深度对话的智能容器。
+# 功能1：自动化的“参数追踪”，如果不继承，你需要手动维护一个列表，把所有Layer的权重存起来。如果你增加了一个层，却忘了更新列表，优化器就找不到它。
+# 如果你继承了，你只需要调用self.parameters()，它就会像剥洋葱一样，把嵌套在featurizer、classifier甚至更深层里的所有权重全部找出来交给优化器。
+# 功能2：状态的“一键同步”，当你调用algorithm.eval()时，这个指令会递归地传递给它内部的所有子模块。你不需要手动去把ResNet改成eval模式、再把 Classifier改成eval模式，一行代码全搞定。
+# 功能3：硬件设备的“集体搬家”，可以一键将所有参数的训练搬到gpu。
+# 功能4：序列化与持久化。nn.Module提供了一个叫state_dict()的方法。它会把模型当前所有的权重、偏置、甚至是 BatchNorm 的运行时统计量，整整齐齐地打包成一个Python字典。
+# 这样你就可以用torch.save()把这个字典存成硬盘上的.pth文件。下次加载时，只需要一句话就能把模型还原到之前的状态。
 class Algorithm(torch.nn.Module):
     """
     A subclass of Algorithm implements a domain generalization algorithm.
@@ -75,7 +82,8 @@ class Algorithm(torch.nn.Module):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(Algorithm, self).__init__()
         self.hparams = hparams
-
+# 因为DG模型的输入和常规模型不一样，输入的是由各环境数据组成的列表，故要用update，而不用常规的forward。
+# update和forward不同，是作者自己规定的，而不是和forward一样，是torch规定的。
     def update(self, minibatches, unlabeled=None):
         """
         Perform one update step, given a list of (x, y) tuples for all
@@ -85,7 +93,13 @@ class Algorithm(torch.nn.Module):
         when task is domain_adaptation.
         """
         raise NotImplementedError
-
+# predict执行分类器的功能，通常只包含一个分类器。
+# 不能把update和predict相当于把forward的功能拆成两段。
+# update执行计算损失的功能，一般的模型将这个功能是放到train中的。update相当于是forward除classifier之外的代码和计算损失的代码的整合。
+# preidct就是仅是forward中关于classifier的功能。
+# 在DG实验中，我们经常需要对多个环境的数据进行复杂的操作。为了避免混淆，框架作者约定，仅用predict执行推理操作。
+# 通常情况下，是train.py管优化，而在这里，每个算法自己管自己的优化过程。
+# 把train.py的部分逻辑融入到模型自身，这样可以在切换模型时，不改变train.py，每个模型都有不同的训练逻辑，要不这样，训练每个模型都要改train.py是非常麻烦的。
     def predict(self, x):
         raise NotImplementedError
 
@@ -584,14 +598,35 @@ class IRM(ERM):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(IRM, self).__init__(input_shape, num_classes, num_domains,
                                   hparams)
+# 当你创建一个nn.Module时，它就像一个带分类抽屉的柜子。PyTorch预留了几个特殊的抽屉：
+# 1、_parameters 抽屉：放权重（Weights）和偏置（Bias）。
+# 2、_modules 抽屉：放子网络（如 self.resnet = ...）。
+# 3、_buffers 抽屉：放那些**“重要但不参与训练”**的张量。
+# 如果你直接写 self.update_count = 0，这只是一个普通的 Python 变量，它不在柜子的抽屉里，模型管家（PyTorch）看不见它。
+# 弊端1：当你执行 torch.save(model.state_dict(), 'model.pth') 时，PyTorch 只会打包 _parameters 和 _buffers 抽屉里的东西。
+# 普通的 self.update_count 会被遗弃。当你加载模型（Load Checkpoint）继续训练时，计数器会从 0 重新开始。对于 IRM 这种依赖步数（Anneal Iters）来切换逻辑的算法，这会导致模型在错误的时间点触发惩罚逻辑。
+# 弊端2：如果你执行model.to('cuda')，所有的 Parameter 和 Buffer 都会自动搬家到显存。但普通的 self.update_count = 0 是留在 CPU 内存里的整数。当你尝试执行 if self.update_count > some_tensor，如果 some_tensor 在 GPU 上，程序可能会因为跨设备计算而崩溃。
+# 当你使用 self.register_buffer('name', tensor) 时，这个变量就获得了“正式编制”：1、自动搬家2、自动存盘3、免于训练。
         self.register_buffer('update_count', torch.tensor([0]))
 
     @staticmethod
     def _irm_penalty(logits, y):
+# 功能：自动检测数据在哪。它查看logits（网络的输出结果）是在GPU上还是CPU上。
+# 接下来的scale张量必须与logits在同一个设备上才能进行数学运算（比如logits*scale）。如果一个在CPU一个在GPU，程序会立刻崩溃。
         device = "cuda" if logits[0][0].is_cuda else "cpu"
+# scale就是IRM公式里的w=1。
         scale = torch.tensor(1.).to(device).requires_grad_()
+# 从索引0开始，每隔2个取一个（取所有偶数位置的数据：0, 2, 4, 6...）。在样本维度进行切片。
         loss_1 = F.cross_entropy(logits[::2] * scale, y[::2])
+# 从索引1开始，每隔2个取一个（取所有奇数位置的数据：1, 3, 5, 7...）。在样本维度进行切片。
         loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2])
+# 通过把数据切分成不相交的两份，去进行两路梯度相乘，而不是和IRMv1公式那样，直接计算梯度了L2范数，即L2范数的平方是一个向量自己点乘自己：|g|^2=g·g。
+# 核心原因在于处理梯度中的噪声。如果直接g·g，无法消除梯度中的噪声，用两路梯度相乘，就可以消去梯度中的噪声。
+# |g|^2=g·g=(g_{true} + ε)·(g_{true} + ε) = g_{true}^2 + 2g_{true}ε + ε^2$。
+# 由于噪声的平方永远是正数，这意味着即使真实的梯度g_{true}已经是0了（即已经达到了不变性），由于噪声的存在，|g|^2的期望值依然会大于0。这会导致模型受到一个永远无法消除的噪声惩罚，使得训练变得极其不稳定，甚至无法收敛。
+# g_1·g_2 = (g_{true} + ε_1)·(g_{true} + ε_2) = g_{true}^2 + g_{true}ε_2 + g_{true}ε_1 + ε_1ε_2
+# 因为噪声是随机且独立的，ε_1，ε_2的期望是0。这就得到了一个关于真实梯度平方的无偏估计（Unbiased Estimator）。
+# g_1·g_2的期望等于直接计算梯度的L2范数，即g·g。同时，也比g·g更干净。
         grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
         grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
         result = torch.sum(grad_1 * grad_2)
@@ -599,24 +634,35 @@ class IRM(ERM):
 
     def update(self, minibatches, unlabeled=None):
         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+# 早期，模型还没学会分类，如果直接加巨大的惩罚，模型会崩溃。所以前N步令权重为 1.0，此时它就像一个普通的分类模型（ERM）。即在训练初期，模型还没有学会如何提取特征。此时的 Penalty（梯度惩罚项）数值通常极小，而NLL（分类损失）很大。
+# 后期，当步数达到阈值，瞬间切换到巨大的 irm_lambda，强制模型开始寻找“不变特征”。
+# 梯度惩罚项通常都非常小，所以需要大的惩罚项。
         penalty_weight = (self.hparams['irm_lambda'] if self.update_count
                           >= self.hparams['irm_penalty_anneal_iters'] else
                           1.0)
+#显示的声明变量是浮点数
         nll = 0.
         penalty = 0.
 
+# 将多个环境的数据拼在一起，一次性通过网络，提高计算效率。
         all_x = torch.cat([x for x, y in minibatches])
         all_logits = self.network(all_x)
         all_logits_idx = 0
         for i, (x, y) in enumerate(minibatches):
+# 从all_logits中，拿取一个环境的数据
             logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
             all_logits_idx += x.shape[0]
+# 计算损失
             nll += F.cross_entropy(logits, y)
             penalty += self._irm_penalty(logits, y)
+# 求平均
         nll /= len(minibatches)
         penalty /= len(minibatches)
         loss = nll + (penalty_weight * penalty)
-
+# 当相等时，重置梯度。
+# 当惩罚权重从 1.0 突然跳到 10000.0 时，Loss 的数值会发生剧烈突变，导致产生的梯度极大。
+# Adam 优化器记录了之前的历史动量。如果不重置，旧的动量加上突然爆发的新梯度，会让模型权重直接被“甩出”合理范围，导致训练失败。重置优化器相当于给模型一个“冷启动”。
+# 这相当于告诉模型：“之前的练习（ERM阶段）只是热身，现在正式进入IRM阶段，我们要换一种节奏跑了。”
         if self.update_count == self.hparams['irm_penalty_anneal_iters']:
             # Reset Adam, because it doesn't like the sharp jump in gradient
             # magnitudes that happens at this step.

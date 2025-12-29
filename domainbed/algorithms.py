@@ -509,6 +509,12 @@ class AbstractDANN(Algorithm):
             self.hparams['nonlinear_classifier'])
         self.discriminator = networks.MLP(self.featurizer.n_outputs,
             num_domains, self.hparams)
+# 这一行代码是用来实现CDANN的，它的作用是为每一个类别生成一个对应的向量（Embedding），并将这个向量“注入”到特征中，告诉判别器当前正在处理的是哪一类物体。
+# 创建一个“字典”，里面有num_classes个向量，每个向量的长度和特征z一样。
+# 在标准的DANN中，判别器只负责看特征z，并猜它来自哪个领域。但这里存在一个逻辑漏洞，如果环境A全是“狗”，环境B全是“猫”。
+# 判别器发现特征里有“耳朵”的特征，它就知道这一定是环境 A（狗），发现特征里有“胡须”的特征，就知道一定是环境B（猫）。判别器根本不去看背景，而是直接认定：有耳朵就是环境 A，有胡须就是环境 B。
+# 判别器虽然找到了关键特征，以判断样本来自哪个环境，但是，特征提取器发现，判别器靠这些特征识别样本来自哪个环境，于是，为了使判别器不能区分样本来自哪个环境，特征提取器就把狗耳朵和猫胡须都模糊了。
+# 虽然达到了欺骗判别器的目的，但是却提取不出类别特征了。
         self.class_embeddings = nn.Embedding(num_classes,
             self.featurizer.n_outputs)
 
@@ -533,42 +539,69 @@ class AbstractDANN(Algorithm):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
         all_z = self.featurizer(all_x)
+# 两种模式，一个是CDANN模式，一个是普通DANN模式。
         if self.conditional:
             disc_input = all_z + self.class_embeddings(all_y)
         else:
             disc_input = all_z
         disc_out = self.discriminator(disc_input)
+# 假设你输入了3个环境的数据，每个环境有64张图，torch.full函数内的意思就是，创建长度为64的全为i的数组，每个环境都是这样，然后拼起来，这样就得到了环境标签。
+# 使用（x.shape[0],）而不是直接x.shape[0]，是因为明确告诉程序“这是一个形状，一个包含一个元素的元组”，而不仅仅是一个“数字”。
+# torch.full这种函数的第一个参数size预期的类型通常是一个序列（Sequence）。x.shape[0]只是一个数值（比如 64）。(x.shape[0], ) 是一个规格描述（表示“我要一个长度为 64 的一维数组”）。
+# 就是为了防止歧义，确保 PyTorch 准确无误地理解我们要创建的张量结构。这是一个写作规范。同样，如果我想创建二维张量，则写（64，32），（64， ）这种写法让一维和二维的写法得到统一。
+# 虽然torch.full比较智能，能猜出你想干嘛，但很多其他的函数（比如自定义的形状变换或一些旧版库）如果只收到一个数字64，会报错说：“我需要一个表示形状的列表，你却给我一个整数”。
         disc_labels = torch.cat([
             torch.full((x.shape[0], ), i, dtype=torch.int64, device=device)
             for i, (x, y) in enumerate(minibatches)
         ])
-
+# 这是为了解决数据不公平的问题，防止一类别样本过多，另一类别样本过少。
         if self.class_balance:
+# 统计频率
             y_counts = F.one_hot(all_y).sum(dim=0)
+# 计算权重，1.是为了计算出的权重是小数，防止被强制四舍五入。这个习惯能有效避免很多莫名其妙的数值错误。
             weights = 1. / (y_counts[all_y] * y_counts.shape[0]).float()
             disc_loss = F.cross_entropy(disc_out, disc_labels, reduction='none')
+#加权损失
             disc_loss = (weights * disc_loss).sum()
         else:
             disc_loss = F.cross_entropy(disc_out, disc_labels)
-
+# 梯度惩罚，防止判别器过强，使得判别损失变成0，一旦Loss变成0，梯度也就消失了。特征提取器就再也拿不到任何反馈，训练就会卡死。
+# autograd.grad（y，x），含义就是求导的dy/dx。loss.backward()是一次性计算出模型所有参数的梯度，而这个是普通的单个求导。
+# 为什么create_graph=True？因为这一步是在loss.backward()之前手动求导。我们需要把这个求导的过程也记录在计算图里，这样最后执行self.disc_opt.step()时，优化器才能针对“梯度的梯度”进行优化。
+# 最后为什么要加[0]？torch.autograd.grad函数的设计是为了通用性，它支持同时对多个输入求导。
+# 如果你的输入是一个列表input=[x,y,z]，那么返回的求出的梯度是一个元组(grad_x, grad_y, grad_z)。如果你只求导一个，它依然会返回一个只装了一个东西的元组，比如 (grad_x, )。
+# 计算图是什么？当你写c=a+b 时，PyTorch不仅仅算出了结果，还在内存里画了一个流程图：a和b指向+节点，最后输出c。
+# 它是为了自动求导（Backpropagation）。当你执行loss.backward()时，PyTorch会沿着这张图从后往前倒退，把梯度分给每一个变量。以a+b=c为例，节点a得到的梯度就是dc/da=1，b也是dc/db=1。
+# 如果不开启create_graph=True，那么当你执行第一步算出input_grad后，为了节省内存，就会把计算input_grad的计算图扔掉。
+# input_grad是总损失的一部分，当你最后执行total_loss.backward()时，程序必须计算d（grad_penalty）/dθ（梯度的梯度），如果没有input_grad的计算图，总损失的backward（）就无法进行反向传播了。
         input_grad = autograd.grad(
             F.cross_entropy(disc_out, disc_labels, reduction='sum'),
             [disc_input], create_graph=True)[0]
+# 把梯度平方，不管方向，只看大小。然后计算每个样本的梯度模长。最后算出这一批样本的平均梯度强度。
         grad_penalty = (input_grad**2).sum(dim=1).mean(dim=0)
         disc_loss += self.hparams['grad_penalty'] * grad_penalty
-
+# 这个参数的意思是：每训练一次生成器，要训练d次判别器。这个参数控制了训练的节奏。
         d_steps_per_g = self.hparams['d_steps_per_g_step']
+# 每训练d_steps_per_g次判别器，训练一次生成器。
+# 为什么训练过程中先训练判别器，且要多训练判别器？如果判别器太弱，根本分不清环境A和B，也就无法提供有用的信息给生成器。
         if (self.update_count.item() % (1+d_steps_per_g) < d_steps_per_g):
-
+# 判别器训练
             self.disc_opt.zero_grad()
             disc_loss.backward()
             self.disc_opt.step()
             return {'disc_loss': disc_loss.item()}
         else:
+# 生成器训练
             all_preds = self.classifier(all_z)
             classifier_loss = F.cross_entropy(all_preds, all_y)
+# -disc_loss是一个反向操作。本来disc_loss越小代表警察越准，现在前面加个负号，意思就是生成器要努力让判别器的损失变大。
+# 判别器损失在生成器损失之中，生成器损失优化过程中，想要最小化生成器损失，那么就会导致-disc_loss变小，即disc_loss变大。
+# 而且这个设计使得优化生成器损失的同时也能优化分类器损失。
             gen_loss = (classifier_loss +
                         (self.hparams['lambda'] * -disc_loss))
+# 在PyTorch中，当你调用.backward()时，梯度是累加的，而不是覆盖的。如果不清零，那么本轮计算出的梯度会直接加在上一轮的旧梯度上。故要进行梯度清零。
+# 虽然计算的是生成器损失，但是生成器损失中用到了判别器损失，反向传播的过程中也会影响到判别器梯度，故要进行判别器梯度清零。
+# 在PyTorch的复杂模型（尤其是 GAN、DANN 这种多个 Loss 互相交织的模型）中，在backward之前把所有相关的optimizer都zero_grad一遍是一种标准且安全的防御性编程习惯。
             self.disc_opt.zero_grad()
             self.gen_opt.zero_grad()
             gen_loss.backward()
@@ -787,7 +820,7 @@ class RDM(ERM):
         self.update_count += 1
 
         return {'update_count': self.update_count.item(), 'total_loss': total_loss.item(), 'erm_loss': erm_loss.item(), 'matching_penalty': matching_penalty.item(), 'variance_penalty': variance_penalty.item(), 'rdm_lambda' : self.hparams['rdm_lambda']}
-
+# 如果说IRM是在找“不变的梯度”，那么VREx就是在找“各环境之间风险的平衡”。它不仅希望平均损失（Mean Loss）最小，还希望各个环境之间的损失差异（Variance）最小。
 class VREx(ERM):
     """V-REx algorithm from http://arxiv.org/abs/2003.00688"""
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -806,13 +839,14 @@ class VREx(ERM):
         all_x = torch.cat([x for x, y in minibatches])
         all_logits = self.network(all_x)
         all_logits_idx = 0
+# 创建一个容器，存储每个环境的loss。
         losses = torch.zeros(len(minibatches))
         for i, (x, y) in enumerate(minibatches):
             logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
             all_logits_idx += x.shape[0]
             nll = F.cross_entropy(logits, y)
             losses[i] = nll
-
+# 算方差
         mean = losses.mean()
         penalty = ((losses - mean) ** 2).mean()
         loss = mean + penalty_weight * penalty
@@ -865,7 +899,7 @@ class Mixup(ERM):
 
         return {'loss': objective.item()}
 
-
+# GroupDRO是哪个环境的表现最差，我就狠狠地优化哪组。GroupDRO的目标不是最小化平均风险，而是最小化最差环境下的风险（Worst-group Risk）。
 class GroupDRO(ERM):
     """
     Robust ERM minimizes the error at the worst minibatch
@@ -878,17 +912,22 @@ class GroupDRO(ERM):
 
     def update(self, minibatches, unlabeled=None):
         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
-
+# 权重向量q的初始化，如果是第一次，那么给每个环境平均分配权重，即都是1.
         if not len(self.q):
             self.q = torch.ones(len(minibatches)).to(device)
-
+# 在GroupDRO中，losses变量不是终点，它要和self.q进行torch.dot（点积）运算。self.q已经被注册为Buffer并移动到了GPU（device）。
+# 在PyTorch中，两个张量进行数学运算（如点积、矩阵相乘），必须位于同一设备上。如果losses在CPU上，而self.q在GPU上，执行torch.dot时程序会直接崩溃并报错。
+# VREx不涉及跨张量运算，故不需要显式to（device），从代码规范的角度讲，VREx最好也要to（deivce）。
+# 还有一个可能的原因，当你在循环里执行losses[i]=nll时，如果nll是GPU上的张量（来自 F.cross_entropy），PyTorch有时会自动将这个标量值传回给losses所在的设备。
         losses = torch.zeros(len(minibatches)).to(device)
 
         for m in range(len(minibatches)):
             x, y = minibatches[m]
             losses[m] = F.cross_entropy(self.predict(x), y)
+# 更新权重q，Loss越大的组，q增加得越快。
+# groupdro_eta是学习率，决定了权重q对loss变化的敏感程度。.exp()是指数梯度上升，如果某个环境m的losses[m]很大，那么exp(eta * loss)就会是一个很大的数，导致self.q[m]迅速膨胀。
             self.q[m] *= (self.hparams["groupdro_eta"] * losses[m].data).exp()
-
+# 归一化，保证所有q的和为1。
         self.q /= self.q.sum()
 
         loss = torch.dot(losses, self.q)

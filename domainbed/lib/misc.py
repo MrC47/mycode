@@ -17,15 +17,25 @@ import torch
 from collections import Counter
 from itertools import cycle
 
-
+#计算两个神经网络参数空间的
 def distance(h1, h2):
     ''' distance of two networks (h1, h2 are classifiers)'''
     dist = 0.
+# state_dict()是PyTorch里的一个字典，存着模型每一层的名字（Key）和对应的权重张量（Value）。这里遍历的是参数的名字。
     for param in h1.state_dict():
+# 根据刚才拿到的名字 param，分别去h1和h2中取出对应的数值张量。
         h1_param, h2_param = h1.state_dict()[param], h2.state_dict()[param]
+# 计算两个张量之间每一个对应元素的差值。并计算范数。对于矩阵，默认计算的是Frobenius范数。
+# 为什么取平方？因为欧几里得距离的公式是 $\sum (x_1 - x_2)^2$。我们先把每一层差异的平方和累加到 dist 里。
         dist += torch.norm(h1_param - h2_param) ** 2  # use Frobenius norms for matrices
+# 对累加完的平方和进行开根号。即欧式距离。
     return torch.sqrt(dist)
-
+# 实现欧几里得投影，通俗的说，该函数的作用是如果一个模型跑得太远了，就把它拉回到以原模型为中心、半径为δ的球体内。” 这在对抗训练（Adversarial Training）和约束优化中非常常见。
+# 对抗训练中，对抗者努力修改模型的参数，想方设法让模型变得最糟糕（比如让 Loss 最大化），训练者的任务是调整模型，让模型变得最稳定。
+# 如果不加限制，这个“鼠”会把模型参数改得面目全非（比如把权重改成无穷大），那模型直接就坏掉了，这种训练也就失去了意义。
+# 为什么要限制在“球体”内？1、保护模型的基本功能：我们希望看到模型在“受到一点点扰动”时是否依然稳健。如果扰动太大，那就不是“测试稳健性”，而是“拆迁”了。2、模拟真实世界的波动：在域泛化（Domain Bed）中，我们假设不同领域（比如照片和素描）之间的差异是有限的。通过在δ范围内制造对抗样本，是模拟在合理范围内的环境变化。
+# 在约束优化中的意义：很多时候，我们寻找的最优解必须满足某些条件（比如参数不能太大，否则会过拟合）。当你更新一步参数后，发现新参数出界了。这时候投影的目的就是：在边界上找一个离出界点最近的点。这就是为什么代码里要算 ratio（比例）——它是为了保证拉回来的时候，方向不变，只缩短距离。
+# delta是允许最大半径，adv_h是尝试跑远的模型，h是中心点模型。
 def proj(delta, adv_h, h):
     ''' return proj_{B(h, \delta)}(adv_h), Euclidean projection to Euclidean ball'''
     ''' adv_h and h are two classifiers'''
@@ -33,17 +43,26 @@ def proj(delta, adv_h, h):
     if dist <= delta:
         return adv_h
     else:
+# 如果超出了范围，就要进行缩放。ratio是一个小于1的比例系数。比如允许距离是10，现在跑到了20，那么ratio就是 0.5。
         ratio = delta / dist
+# 使用zip同时遍历两个模型的每一层参数。
         for param_h, param_adv_h in zip(h.parameters(), adv_h.parameters()):
+# 投影公式，(param_adv_h - param_h)是算出从中心点指向远方的向量。ration*（）用于把这个距离缩短。param_h + ...表示从中心点出发，沿着缩短后的向量走一段。这样param_adv_h被强行拉回到了距离param_h正好等于delta的那个球面上。
             param_adv_h.data = param_h + ratio * (param_adv_h - param_h)
         # print("distance: ", distance(adv_h, h))
         return adv_h
-
+# 计算两个字典（通常存储的是模型的参数 state_dict）之间的L2距离（均方误差）。
+# 两个字典dict_1和dict_2。在PyTorch中，这通常是model.state_dict()，键是层名，值是权重张量。
 def l2_between_dicts(dict_1, dict_2):
+# 检查两个字典的长度是否相等。如果两个模型结构不同（比如一个有10层，一个有5层），计算就没有意义了。如果长度不等，程序会直接报错并停止。
     assert len(dict_1) == len(dict_2)
+# 按Key的字母顺序提取所有参数。sotred（）非常重要，因为字典在Python中虽然是有序的，但为了绝对保险，必须手动排序。这样能确保dict_1的第一层权重对应的是dict_2的第一层权重，而不是错位去减第二层。
     dict_1_values = [dict_1[key] for key in sorted(dict_1.keys())]
     dict_2_values = [dict_2[key] for key in sorted(dict_1.keys())]
     return (
+# 把每一层的矩阵拉直成一条一维向量。把这些拉直后的线头尾相接，拼成一根极长的大向量。然后对每一维的差值求平方，最后再平方的平均值，即最后算出的是均方误差MSE。
+# torch.cat接收的是一个元组或列表。作者在这里显式地转换成tuple是为了符合PyTorch早期的语法规范，也是一种非常稳健的写法。
+# 这个函数在DomainBed中通常用来监控训练的稳定性：如果（两个epoch或者当前模型与初始状态的）l2_between_dicts的值突然变得巨大，说明模型参数正在发生剧烈震荡。又三种解决方案：1、调小学习率。2、增加权重衰减。3、使用模型平均。
         torch.cat(tuple([t.view(-1) for t in dict_1_values])) -
         torch.cat(tuple([t.view(-1) for t in dict_2_values]))
     ).pow(2).mean()

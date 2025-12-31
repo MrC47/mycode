@@ -7,7 +7,8 @@ def get_test_records(records):
     """Given records with a common test env, get the test records (i.e. the
     records with *only* that single test env and no other test envs)"""
     return records.filter(lambda r: len(r['args']['test_envs']) == 1)
-
+# 在机器学习里，我们不能直接看测试集的结果来选模型（这叫“作弊”）。我们必须根据验证集（Validation Set）的表现来选出最好的参数，然后再看它在测试集（Test Set）上的真实威力。
+# 这个抽象类定义了模型选择的通用流程。
 class SelectionMethod:
     """Abstract class whose subclasses implement strategies for model
     selection across hparams and timesteps."""
@@ -22,7 +23,7 @@ class SelectionMethod:
         the best val-acc and corresponding test-acc for that run.
         """
         raise NotImplementedError
-
+# 把所有不同随机种子的运行结果拿出来，按验证集准确率排个序。
     @classmethod
     def hparams_accs(self, records):
         """
@@ -38,7 +39,7 @@ class SelectionMethod:
             ).filter(lambda x: x[0] is not None)
             .sorted(key=lambda x: x[0]['val_acc'])[::-1]
         )
-
+# 选出表现最好的那个“冠军”，返回它对应的测试集得分。
     @classmethod
     def sweep_acc(self, records):
         """

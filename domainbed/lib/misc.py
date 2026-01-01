@@ -67,51 +67,77 @@ def l2_between_dicts(dict_1, dict_2):
         torch.cat(tuple([t.view(-1) for t in dict_2_values]))
     ).pow(2).mean()
 
+# 这段代码实现的是深度学习中的一种技术：移动平均（Moving Average），具体在这里叫SMA (Simple Moving Average)。
+# 其核心思想是与其相信训练过程中某一个瞬间的模型，不如把过去一段时间的模型全部加起来取平均。 这样得到的模型通常更稳健，泛化能力更强。
 class ErmPlusPlusMovingAvg:
     def __init__(self, network):
         self.network = network
+# 复制一份网络，这个网络就是用来存储“平均后的参数”的影子模型。
         self.network_sma = copy.deepcopy(network)
+# 将影子模型设为评估模式。因为它不负责训练，只负责被平均。
         self.network_sma.eval()
+# 设置一个“等待期”。前 600 步模型还不稳定，先不进行平均。
         self.sma_start_iter = 600
+# 记录总步数。
         self.global_iter = 0
+# 记录参与平均的次数。
         self.sma_count = 0
-
+# 这个函数通常在每个训练步（Step）之后被调用一次。
     def update_sma(self):
         self.global_iter += 1
         new_dict = {}
         if self.global_iter>=self.sma_start_iter:
             self.sma_count += 1
+# 过了等待期（开始算平均），使用zip同时拉起两个模型的参数：param_q是当前正在跳动的原始模型，param_k是之前的平均模型。name是一个字符串，代表神经网络中每一个具体参数（权重或偏置）的“身份证号”或“路径”
             for (name,param_q), (_,param_k) in zip(self.network.state_dict().items(), self.network_sma.state_dict().items()):
+# 排除掉BatchNorm层里的一些统计参数，这些不需要手动平均。
+# 在神经网络中，有一种非常常用的层叫Batch Normalization (批归一化，简称 BN 层)。BN层除了有需要学习的权重（weight）和偏置（bias）外，还需要记录一些“统计数据”来帮助它工作。num_batches_tracked就是其中之一。
+# 它本质上是一个“计数器”，记录了这个BN层一共处理了多少个batch的数据。num_batches_tracked是一个整数（LongTensor）。
+# 在PyTorch的底层定义中，模型参数分为两类：1、Parameters (参数)：比如权重和偏置。它们是浮点数，通过梯度下降进行更新。2、Buffers (缓存)：比如BN层的均值（running_mean）、方差（running_var）和这个num_batches_tracked。它们不通过梯度更新，但需要被保存。
+# 如果不写这行判断，代码会尝试对它做移动平均计算，这会导致两个严重问题：1、类型冲突 (Type Mismatch)，num_batches_tracked是整数。当你把它除以(1. + count)（浮点数）时，结果会变成浮点数。如果你尝试把一个浮点数填回一个本该是整数的坑位，PyTorch可能会报错。
+# 2、逻辑错误 (Logic Error)：num_batches_tracked的含义是“处理过的batch总数”。影子模型（SMA）处理了N个 batch。原始模型处理了N个 batch。对它们求平均值没有任何意义。正确的做法是让它们各自记录自己的计数，或者直接保留原始模型的计数。
+# 为什么不排除BN里的均值和方差呢？因为均值和方差代表了模型在训练过程中观察到的数据的“统计特征”。它们参与了前向传播的数学计算。既然是浮点数，它们在数学上是可以进行加权平均计算的，不会产生类型错误。
                 if 'num_batches_tracked' not in name:
-                   new_dict[name] = ((param_k.data.detach().clone()* self.sma_count + param_q.data.detach().clone())/(1.+self.sma_count))
+# 使用的是增量平均，假设之前平均了n次，现在加入第n+1个模型，new_avg = old_sum + new_val / (n+1)
+# old_sum = param_k*n,param_k是已经算好的均值，为了参与n+1次的平均，故要乘n。
+# 为什么不直接求和，而是用均值乘n呢？1、防止数值溢出。2、满足即时可用性，这段代码的设计思路是让network_sma随时随地都是一个可以直接拿来测试的有效模型。如果存的是总和，模型就“没法即时可用了”，必须手动除以n才能恢复成正常的权重。
+                    new_dict[name] = ((param_k.data.detach().clone()* self.sma_count + param_q.data.detach().clone())/(1.+self.sma_count))
         else:
+# 处在等待期内，直接把原始模型network的参数复制给network_sma。这相当于让影子模型先跟着跑，直到跑稳了再开始平均。
             for (name,param_q), (_,param_k) in zip(self.network.state_dict().items(), self.network_sma.state_dict().items()):
                 if 'num_batches_tracked' not in name:
                     new_dict[name] = param_q.detach().data.clone()
         self.network_sma.load_state_dict(new_dict)
 
-
+# 这段代码实现的是指数移动平均（Exponential Moving Average, EMA）。之前的是算数平均。EMA给近期的数据分配更高的权重，给很久以前的数据分配较低的权重。
 class MovingAverage:
 
     def __init__(self, ema, oneminusema_correction=True):
+# 衰减系数（通常设为 0.99 或 0.999）。它代表了“记忆”的强度。
         self.ema = ema
+# 一个字典，用来存储每一层参数平滑后的结果。
         self.ema_data = {}
         self._updates = 0
+# 这是一个缩放修正开关，目的是为了保持数值的量级。
         self._oneminusema_correction = oneminusema_correction
-
+# dict_data通常是当前Step的模型参数字典（state_dict）。
     def update(self, dict_data):
         ema_dict_data = {}
         for name, data in dict_data.items():
+# 拉平成一行，即一维向量。
             data = data.view(1, -1)
             if self._updates == 0:
+# 如果以前没平均果，则赋零值
                 previous_data = torch.zeros_like(data)
             else:
+# 如果有进行平均，就读取之前的值。
                 previous_data = self.ema_data[name]
-
+# ema越大，模型对过去记忆力越强，更新越迟钝（更平滑）。ema越小，则模型对当前更敏感。
             ema_data = self.ema * previous_data + (1 - self.ema) * data
             if self._oneminusema_correction:
                 # correction by 1/(1 - self.ema)
                 # so that the gradients amplitude backpropagated in data is independent of self.ema
+# 这里就是指数移动平均里的偏差修正。只不过这里是简单粗暴地每一轮都除以（1-ema）。
                 ema_dict_data[name] = ema_data / (1 - self.ema)
             else:
                 ema_dict_data[name] = ema_data
@@ -121,7 +147,7 @@ class MovingAverage:
         return ema_dict_data
 
 
-
+# 为类别不平衡的数据集生成采样权重。如果某个类别的数据特别少，就给它更高的权重，让模型在训练时有更多机会“看到”它。这种方法被称为加权采样（Weighted Sampling）。
 def make_weights_for_balanced_classes(dataset):
     counts = Counter()
     classes = []
@@ -134,25 +160,39 @@ def make_weights_for_balanced_classes(dataset):
 
     weight_per_class = {}
     for y in counts:
+# 计算每个类别的权重，样本越少，权重越大。
         weight_per_class[y] = 1 / (counts[y] * n_classes)
-
+# 根据刚才算好的各类权重，给数据集里的每一个样本贴上属于它的权重标签。返回一个和数据集等长的PyTorch张量weights。
     weights = torch.zeros(len(dataset))
     for i, y in enumerate(classes):
         weights[i] = weight_per_class[int(y)]
 
     return weights
 
+# 一个用于调试的函数，设置断点，因为再命令行中，没有图形界面，讲这个函数加在你觉得有问题的代码行之前。
 def pdb():
+# 在很多科研框架中，为了记录日志，程序会把sys.stdout（标准输出）重定向到文件（比如 output.txt）或者某个网页UI上。如果你在调试，交互界面的提示符（(Pdb)）也会被发往文件，你根本看不见，也就没法输入命令。
+# 这一行强行把输出拨回到真正的控制台终端（sys.__stdout__ 代表系统原始的、未被修改过的输出流）。
     sys.stdout = sys.__stdout__
     import pdb
+# 为什么提示输入'n'？：因为当你调用这个自定义的pdb()函数时，断点是停在这个函数内部的。输入n（next）或up才能跳回到你真正想调试的那行代码。
+# Pdb 常用指令快捷表：1、l，查看当前断点周围的代码内容。2、p，打印变量的值。3、n，执行下一行代码。4、s，进入函数内部（如果你想看某个子函数的逻辑）。5、c，退出调试模式，让程序继续正常运行。6、q，强制结束整个程序。
     print("Launching PDB, enter 'n' to step to parent function.")
     pdb.set_trace()
 
+# 这段代码是一个非常稳健的随机数种子生成器。它的作用是：无论你给它什么输入（数字、字符串、列表等），它都能将其转化为一个固定范围内的整数，作为随机种子的“根”。
+# *args这是一个Python的语法糖，代表接收任意数量、任意类型的参数。你可能会把文件名、迭代次数、超参数同时传进去。只要这些输入不变，生成的种子就永远不变。
 def seed_hash(*args):
     """
     Derive an integer hash from all args, for use as a random seed.
     """
     args_str = str(args)
+# .encode("utf-8")：将字符串转为字节流（二进制），因为哈希算法不直接处理字符串。
+# .hexdigest()：将 MD5 算出来的二进制结果转为一个16进制的字符串。
+# ，16：配合 int() 函数，告诉Python：“请把这个16进制的字符串转成一个巨大的十进制整数。"
+# % (2**31)将那个巨大的整数限制在0到2^{31}-1之间。因为在很多系统（尤其是 C 语言底层）中，随机数种子的最大值通常是32位整数的上限。超过这个范围可能会导致程序报错或溢出。
+# 为什么要这么麻烦？直接用random.seed(42)不行吗？因为在DomainBed这种大规模实验框架里，简单的固定种子是不够用的。假设你在跑10个不同的实验，每个实验的learning_rate不同。如果你在代码里硬编码seed = 42，那么这10个实验的随机初始化竟然是一模一样的。
+# 使用这种方式，为每个实验生成不同的种子，既保证了实验之间的独立性，又保证了如果你以后用同样的参数重跑，结果一定能复现。
     return int(hashlib.md5(args_str.encode("utf-8")).hexdigest(), 16) % (2**31)
 
 def print_separator():
@@ -172,17 +212,24 @@ def print_row(row, colwidth=10, latex=False):
         return str(x).ljust(colwidth)[:colwidth]
     print(sep.join([format_val(x) for x in row]), end_)
 
+# 这段代码定义了一个非常轻量级的类，它的核心作用是：在不复制原始数据的前提下，为一个庞大的数据集创建一个“虚拟视图”或“切片”。在DomainBed这种需要把数据集拆分为训练集（Train）和验证集（Validation）的场景中，这个类非常高效。
+# 它继承了PyTorch标准的Dataset类。这意味着它的实例可以像普通数据集一样被放入DataLoader中进行迭代。
 class _SplitDataset(torch.utils.data.Dataset):
     """Used by split_dataset"""
     def __init__(self, underlying_dataset, keys):
         super(_SplitDataset, self).__init__()
+# underlying_dataset：指的是“底层数据集”（即那个还没拆分的完整大数组）。
         self.underlying_dataset = underlying_dataset
+# keys：这是一个索引列表（例如 [0, 2, 5, 10...]）。它记录了属于这个子集的样本在原图中的位置。
         self.keys = keys
     def __getitem__(self, key):
         return self.underlying_dataset[self.keys[key]]
     def __len__(self):
         return len(self.keys)
 
+# 将数据集按参数n切分为两部分，用于训练集和验证集。
+# 为什么 DomainBed 要这样拆分？在域泛化（Domain Generalization）实验中，我们通常需要从每一个领域（Domain）中拿出一部分数据做验证。而且，为了公平对比，必须保证验证集的划分是随机的，但又是可复现的。
+# 测试集呢？在DomainBed中，并不是没有测试集，而是通过一种**“留一法”（Leave-one-out）**的逻辑来定义测试集。即留一个域作为测试集，剩下的域，每个域的数据，一部分作为训练集，一部分作为验证集。
 def split_dataset(dataset, n, seed=0):
     """
     Return a pair of datasets corresponding to a random split of the given
@@ -196,29 +243,39 @@ def split_dataset(dataset, n, seed=0):
     keys_2 = keys[n:]
     return _SplitDataset(dataset, keys_1), _SplitDataset(dataset, keys_2)
 
+# 它是许多**域对齐（Domain Alignment）**算法（如VREx, Fish, SD等）的核心。它的作用是：从多个不同的领域中随机两两配对，构造出“对比组”。
+# minibatches：这是一个列表，里面每个元素代表一个领域（Domain）的一个Batch。例如，如果有3个领域，列表长度就是 3。
 def random_pairs_of_minibatches(minibatches):
+# randperm：生成一个随机排列。比如有 3 个领域，可能会生成 [2, 0, 1]。打乱领域的顺序，确保每一轮训练时，领域之间的配对都是随机的。
     perm = torch.randperm(len(minibatches)).tolist()
     pairs = []
 
     for i in range(len(minibatches)):
+# 实现所有领域能够两两配对，不重不漏。例如有[A，B，C]三个领域，则i=A，j=B、i=B，j=C，i=C，j=A。
         j = i + 1 if i < (len(minibatches) - 1) else 0
-
+# 取出第i个领域的数据和标签，取出第j个领域的数据和标签。
         xi, yi = minibatches[perm[i]][0], minibatches[perm[i]][1]
         xj, yj = minibatches[perm[j]][0], minibatches[perm[j]][1]
-
+# 对齐长度：不同领域的Batch Size可能因为数据量不平衡而略有不同。为了做减法或对比运算，必须确保两组数据的样本数量一致。
         min_n = min(len(xi), len(xj))
-
+# 将截取到相同长度的两组数据打包成一个pair。
         pairs.append(((xi[:min_n], yi[:min_n]), (xj[:min_n], yj[:min_n])))
 
     return pairs
 
+# 这段代码实现的是元学习（Meta-Learning）算法（如 MLDG, MetaReg 等）在域泛化中的核心逻辑。
+# 它与刚才看到的“随机配对”非常相似，但有一个本质的区别：它将领域划分为“元训练集”（Meta-Train）和“元测试集”（Meta-Test）。
+# 也就是输入是一系列的pair，即pairs数组，先使用这些数组中的元组的第一位，即训练数据进行训练，然后再使用第二维，即测试数据进行测试。
+# 为什么不手动划分几个领域作为训练集，一个领域作为测试集呢，非要搞那么麻烦。其实，“手动划分”和代码里的“麻烦操作”同时存在，但它们发生在不同的层级，服务于不同的目的。
+# 简单来说：手动划分是为了“大考”，而MLDG的pairs是为了“模拟考”。即在训练集中，再分测试集。这是MLDG的内容了。
 def split_meta_train_test(minibatches, num_meta_test=1):
     n_domains = len(minibatches)
     perm = torch.randperm(n_domains).tolist()
     pairs = []
     meta_train = perm[:(n_domains-num_meta_test)]
     meta_test = perm[-num_meta_test:]
-
+# cycle(meta_test)：这是一个无限循环迭代器。如果meta_test只有1个域（比如域 C），而meta_train有 3 个域（A, B, D），它会产生：(A, C), (B, C), (D, C)。
+# 让每一个参与“训练”的领域都去和那个“模拟测试”的领域进行配对。
     for i,j in zip(meta_train, cycle(meta_test)):
          xi, yi = minibatches[i][0], minibatches[i][1]
          xj, yj = minibatches[j][0], minibatches[j][1]
@@ -228,6 +285,7 @@ def split_meta_train_test(minibatches, num_meta_test=1):
 
     return pairs
 
+# 一个计算准确率的函数。
 def accuracy(network, loader, weights, device):
     correct = 0
     total = 0
@@ -254,11 +312,15 @@ def accuracy(network, loader, weights, device):
 
     return correct / total
 
+# 这段代码实现了一个非常经典且实用的功能：“镜像输出”（Output Mirroring）。
+# 在Linux命令行中有一个命令叫tee，它的作用是把数据像字母“T”的形状一样分开：一端流向屏幕（屏幕显示），另一端流向文件（保存记录）。这个类就是在用Python模拟这个功能。
+# 在train.py的开头，你通常会看到这样一行：ys.stdout = Tee(os.path.join(args.output_dir, 'out.txt'))，即同时把输出发向屏幕和文件。
+# 与pdb()函数的联系：如果你用了Tee，那么sys.stdout已经变成了一个“双向水管”。你想进入PDB调试时，PDB这种复杂的交互式工具无法在Tee这个自定义类里正常工作。所以pdb()第一步必须先把sys.stdout还原回系统原始的sys.__stdout__，这样你才能在屏幕上看到(Pdb)提示符并输入命令。
 class Tee:
     def __init__(self, fname, mode="a"):
         self.stdout = sys.stdout
         self.file = open(fname, mode)
-
+# 为什么要flush？通常系统为了提高性能，会把要打印的内容先存进内存缓冲区。如果你不Flush，万一程序突然崩溃（比如OOM显存溢出），缓冲区里的报错信息可能还没来得及写进磁盘就丢失了。强制Flush保证了日志的实时性。
     def write(self, message):
         self.stdout.write(message)
         self.file.write(message)
@@ -267,7 +329,9 @@ class Tee:
     def flush(self):
         self.stdout.flush()
         self.file.flush()
-
+# 这段代码定义了一个非常强大的工具类ParamDict。它的核心逻辑是：把一个存放模型参数的“字典”，伪装成一个可以进行数学运算的“向量”或“数字”。
+# 在元学习（Meta-Learning，如 MLDG、Reptile）中，我们需要频繁地对整套模型参数进行加减乘除，传统的做法是写循环遍历字典，而这个类让你能像写普通数学题一样操作整套权重。
+# 个类继承自OrderedDict（有序字典），但它重写了Python的算术运算符（+, -, *, /）。
 class ParamDict(OrderedDict):
     """Code adapted from https://github.com/Alok/rl_implementations/tree/master/reptile.
     A dictionary where the values are Tensors, meant to represent weights of
@@ -275,15 +339,21 @@ class ParamDict(OrderedDict):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, *kwargs)
-
+# 运算原型，这是内部的“中央处理器”。当你执行运算时，它会判断：如果是数字，就把字典里的每一个Tensor都和这个数字做运算。如果是另一个字典，就把两个字典中“相同名字”的 Tensor 拿出来做对位运算。
     def _prototype(self, other, op):
+# 判断另一个参与运算的“数”是不是纯数字，如果是，则
+# {k: op(v, other) for k, v in self.items()}是一个字典推导式。
+# self.items()：遍历当前模型的所有层。k是层名（如 'layer1.weight'），v 是这一层的Tensor张量。
+# op(v, other)：对这一层的张量v执行指定的运算（如 add 或 mul），操作数就是那个数字other。
+# PyTorch的广播机制：这里利用了 PyTorch 的特性。当你用Tensor + 5时，PyTorch会自动把这个5加到张量里的每一个元素上。
+# ParamDict(...)：将生成的新字典重新包装成ParamDict类，这样你得到的结果依然拥有“数学超能力”，可以继续进行下一步运算。
         if isinstance(other, Number):
             return ParamDict({k: op(v, other) for k, v in self.items()})
         elif isinstance(other, dict):
             return ParamDict({k: op(self[k], other[k]) for k in self})
         else:
             raise NotImplementedError
-
+# operator.add是Python内置operator模块中的一个函数版本的加法运算符。operator.add(a, b)和你平时写的a + b在功能上是完全等价的。
     def __add__(self, other):
         return self._prototype(other, operator.add)
 

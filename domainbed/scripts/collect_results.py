@@ -23,11 +23,14 @@ from domainbed import model_selection
 from domainbed.lib.query import Q
 import warnings
 
+# 从字典d中删除特定的key，并返回一个新字典。由于d.copy()，故不会改变原始的字典。
 def remove_key(d,key):
     new_d = d.copy()
     new_d.pop(key)
     return new_d
 
+# 这段代码定义了一个递归冻结函数。它的核心目的是将一个复杂的、可变的Python对象（如列表、字典）转换为一个不可变的（Immutable）版本。
+# 在Python中，只有不可变的对象才是“可哈希的”（Hashable），这意味着它们可以作为字典的键，或者存入集合（Set）中。
 def recursive_freeze(obj):
     if isinstance(obj, dict):
         return frozenset((key, recursive_freeze(val)) for key, val in obj.items())

@@ -99,6 +99,14 @@ class InfiniteDataLoaderWithoutReplacement:
 
 
 
+# 在传统的PyTorch DataLoader中，每当一个Epoch（所有数据过完一遍）结束，程序就会销毁现有的子进程（Worker）并在下一个Epoch开始时重新创建。
+# 如果你有10个环境，每个环境都在频繁切换Epoch，这种“销毁-创建”的开销会积少成多，导致GPU经常在空转等待。
+# FastDataLoader让子进程永不停止，像一条永动机流水线一样不断吐出数据，而通过外部逻辑来控制什么时候算作一个Epoch。
+# InfiniteDataLoader是给训练准备的（真正的无限），而FastDataLoader是给验证准备的（伪装的无限）。
+# InfiniteDataLoader(真正无限)： 它没有__len__方法，也没有循环边界。当你调用next()时，它永远返回数据。用于训练循环。因为DomainBed的训练不是按Epoch算的，而是按Step（步数）算的（比如跑 5000 步）。你需要一个“水龙头”，只要不关，它就一直出水。
+# FastDataLoader(伪装无限)：它有__len__方法，并且__iter__里写了for _ in range(len(self))。用于评估/验证 (Evaluation)。在验证时，我们需要把数据集完整地过一遍且仅过一遍。它通过外部的计数器,即range（len）保证了它会在跑完一轮后停下来。
+# InfiniteDataLoader：通常配合RandomSampler(replacement=True)（有放回采样）或者简单的无限循环。它不保证每一轮出的数据不重复，只保证一直有数据。
+# FastDataLoader：内部使用了RandomSampler(replacement=False)。它能确保在_length定义的一个周期内，每个样本都被且仅被抽到一次。这符合测试集/验证集评估的逻辑。
 class FastDataLoader:
     """DataLoader wrapper with slightly improved speed by not respawning worker
     processes at every epoch."""

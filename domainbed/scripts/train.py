@@ -68,6 +68,7 @@ if __name__ == "__main__":
     print("\tNumPy: {}".format(np.__version__))
     print("\tPIL: {}".format(PIL.__version__))
 
+# vars（object）：返回对象object的属性和属性值的字典对象。object可以是类，也可以是python模块（文件）。
     print('Args:')
     for k, v in sorted(vars(args).items()):
         print('\t{}: {}'.format(k, v))
@@ -95,7 +96,11 @@ if __name__ == "__main__":
     else:
         device = "cpu"
 
+# 这一段代码利用了python的反射功能，反射，就是是指程序在运行时（Runtime）能够“观察”并“修改”自身结构和行为的能力。简单点说，就是代码可以根据一个“字符串名字”去找到对应的变量、函数或类。
+# 普通调用：dataset = datasets.OfficeHome(...)
+# 反射调用：getattr(datasets, "OfficeHome")(...)
     if args.dataset in vars(datasets):
+# 从字典中取出所选定的类，并实例化。
         dataset = vars(datasets)[args.dataset](args.data_dir,
             args.test_envs, hparams)
     else:
@@ -113,21 +118,28 @@ if __name__ == "__main__":
     # domain generalization and domain adaptation results, then domain
     # generalization algorithms should create the same 'uda-splits', which will
     # be discared at training.
+
+    # 它的目的是将每一个环境（Domain）的数据切分成不同的子集，以支持“领域泛化（DG）”和“无监督领域自适应（UDA）”两种任务的公平对比。
+    # in_splits存每个环境的训练部分（主要的学习来源）。
+    # out_splits存每个环境的验证部分（用于模型选择，类似开发集）。
+    # uda_splits存测试环境中的无标签数据（仅用于领域自适应任务）。
     in_splits = []
     out_splits = []
     uda_splits = []
     for env_i, env in enumerate(dataset):
         uda = []
-
+# 将当前环境 (env) 切分为 out 和 in。
+# args.holdout_fraction通常是0.2，表示 20%拿出来做验证(out)，80%留着做训练(in_)。
+# misc.seed_hash 确保每个环境的切分顺序是由trial_seed决定的，保证可重复性。
         out, in_ = misc.split_dataset(env,
             int(len(env)*args.holdout_fraction),
             misc.seed_hash(args.trial_seed, env_i))
-
+# 该部分针对UDA。
         if env_i in args.test_envs:
             uda, in_ = misc.split_dataset(in_,
                 int(len(in_)*args.uda_holdout_fraction),
                 misc.seed_hash(args.trial_seed, env_i))
-
+# 如果超参数要求类别平衡（防止某些类别样本太多导致偏差）。
         if hparams['class_balanced']:
             in_weights = misc.make_weights_for_balanced_classes(in_)
             out_weights = misc.make_weights_for_balanced_classes(out)
@@ -139,10 +151,12 @@ if __name__ == "__main__":
         out_splits.append((out, out_weights))
         if len(uda):
             uda_splits.append((uda, uda_weights))
-
+# 如果你明确要求做“领域自适应”任务，但结果没切出 UDA 数据，报错。
     if args.task == "domain_adaptation" and len(uda_splits) == 0:
         raise ValueError("Not enough unlabeled samples for domain adaptation.")
 
+# 可以看到，train_loadrs是一个列表，里面的每一个元素都是InfiniteDataLoader，一个环境一个InfiniteDataLoader。
+# 在构建的train_loaders的时候，用到了列表推导，并把测试集排除在外了。if i not in args.test_envs
     train_loaders = [InfiniteDataLoader(
         dataset=env,
         weights=env_weights,
@@ -158,19 +172,26 @@ if __name__ == "__main__":
         num_workers=dataset.N_WORKERS)
         for i, (env, env_weights) in enumerate(uda_splits)]
 
+# 为什么验证集还要用到in_splits、out_splits和uda_splits，不是光用out_splits就行了吗？
+# 深度学习里，我们不仅要关心模型学得好不好，还要关心它学没学进去。
+# 为什么要测模型已经看过的in_splits？因为如果模型在in_splits（训练集）上的准确率只有30%，而在out_splits（验证集）上也只有30%，你就知道：这不是泛化的问题，是模型根本没学会，或者训练还没结束。
+# 如果你在eval_loaders里删掉了in_splits，你的实验记录里就只剩下一堆验证集的分数。
+# 当你的实验效果很差时，你会不明白：是模型过拟合太严重了吗？（不知道，因为没测训练集分数）。是模型欠拟合根本没动吗？（不知道，因为没测训练集分数）。 所以，把它们全加起来是为了在评估阶段，给模型做一次“全身体检”。
     eval_loaders = [FastDataLoader(
         dataset=env,
         batch_size=64,
         num_workers=dataset.N_WORKERS)
         for env, _ in (in_splits + out_splits + uda_splits)]
     eval_weights = [None for _, weights in (in_splits + out_splits + uda_splits)]
+# 如果没有这行代码，你的日志可能长这样：{"step": 100, "acc": [0.9, 0.8, 0.7, 0.4, 0.3, 0.2]} 你完全无法分辨0.4到底是训练集的准确率，还是测试集的。
+# 有了这行代码，日志会变成这样：{"step": 100, "env0_in": 0.9, "env1_in": 0.8, "env2_out": 0.4 ...} 这样你一眼就能看出：模型在训练集（env0_in）跑得很好，但在测试集（env2_out）跑得很烂。
     eval_loader_names = ['env{}_in'.format(i)
         for i in range(len(in_splits))]
     eval_loader_names += ['env{}_out'.format(i)
         for i in range(len(out_splits))]
     eval_loader_names += ['env{}_uda'.format(i)
         for i in range(len(uda_splits))]
-
+# 算法类实例化。
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(dataset) - len(args.test_envs), hparams)
 
@@ -203,6 +224,7 @@ if __name__ == "__main__":
 
 
     last_results_keys = None
+# 为什么这里要用range(start_step, n_steps)，不直接用n_steps。
     for step in range(start_step, n_steps):
         step_start_time = time.time()
         minibatches_device = [(x.to(device), y.to(device))

@@ -166,7 +166,9 @@ if __name__ == "__main__":
         batch_size=64,
         num_workers=dataset.N_WORKERS)
         for env, _ in (in_splits + out_splits + uda_splits)]
-
+# eval_loaders_iid和eval_loaders的不同指出在于，eval_loaders_iid只有out_splits且还把测试环境踢出去了if i not in args.test_envs。
+# 之所以踢出去了，是因为后面的set_lr 的目的是为了调整超参数（学习率）。在严谨的机器学习实验中：绝对不能根据“测试集”的表现来调整超参数。
+# out_splits是包含各训练环境和测试环境20%的数据。
     eval_loaders_iid = [FastDataLoader(
         dataset=env,
         batch_size=64,
@@ -198,7 +200,11 @@ if __name__ == "__main__":
 
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
-
+# 在此之前的内容和train.py没有什么差别。
+# 相比于train.py这里的save_checkpoint和torch.save(save_dict, os.path.join(args.output_dir, filename))被移到了后面。
+# train_autolr.py和train.py不同的是，其使用两阶段训练法，目的是为了解决在领域泛化中如何选择最优学习率的问题。
+# 这里不保存是因为第一阶段的目的是寻找最佳的schedule（学习率方案）。在这个阶段，模型只用了80%的数据进行训练。
+# 对于研究人员来说，一个只用80%数据练出来的模型是不完整的，通常不会在生产环境或最终测试中使用。
 
     last_results_keys = None
     for step in range(start_step, n_steps):
@@ -217,8 +223,12 @@ if __name__ == "__main__":
             checkpoint_vals[key].append(val)
 
         if (step % checkpoint_freq == 0) or (step == n_steps - 1):
+# 相比于train.py，这里不一样。
+# 正常的train.py学习率是固定的或者按预设衰减的。而这里，算法会根据eval_loaders_iid（训练域的验证集）的表现，动态地去探测或计算最适合当前数据的学习率。
+# 首先，模型用80%的数据跑,用的是train_dataloader。跑完到达特定step数之后，启动定期验证，在这个过程中，相比于train.py，加了学习率自适应的环节。
+# set_lr会使用eval_loaders_iid去评估当前的学习率怎么样，并返回一个学习率进度表。
            schedule = algorithm.set_lr(eval_loaders_iid = eval_loaders_iid, device=device)
-
+# 早停机制，这意味着如果set_lr探测到学习率已经归零，或者某种指标达到了阈值，它会直接掐断第一阶段的训练。
            if schedule is not None and schedule[-1] == [0.0]:
                break
 
@@ -274,6 +284,11 @@ if __name__ == "__main__":
     # be discared at training.
     in_splits = []
     uda_splits = []
+# 这里不同，args.holdout_fraction = 0.0说明所有的训练环境的数据都用于训练，不分从各训练环境中分出一部分用于验证。
+# 在train.py文件中，分出out_splits是为了从各训练环境中拿出20%输入eval_loaders用于验证，除此之外就没别的作用了。
+# 再train_autolr.py中，out_splits被用于了生成学习率列表。
+# 因为在第一阶段，我们得到了学习率进度表，在第二阶段，就没必要单独分出out_splits了。
+# 它直接从你传入的schedule列表中，根据当前的step（步数），把对应位置的那个数字翻出来。它把这个数字强行设置给优化器：optimizer.param_groups[0]['lr'] = schedule[current_idx]。
     args.holdout_fraction = 0.0
     for env_i, env in enumerate(dataset):
         uda = []
@@ -377,8 +392,11 @@ if __name__ == "__main__":
                 'epoch': step / steps_per_epoch,
                 'lr': float(algorithm.optimizer.param_groups[0]['lr'])
             }
-
+# 在这里，使用了第一阶段生成的学习率进度表。
             schedule = algorithm.set_lr(schedule= schedule)
+# 可以看到，相比于第一阶段，这里也变了。
+# 在第一阶段，它可能返回到目前为止所有的记录，所以看最后一位 (-1) 是否为 0。
+# 在第二阶段，它可能只返回当前这一步要用的那个值（封装成了一个小列表），所以看第一位 (0) 是否为 0。
             if schedule is not None and schedule[0] == [0.0]:
                break
 

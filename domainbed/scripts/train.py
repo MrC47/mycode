@@ -200,16 +200,22 @@ if __name__ == "__main__":
 
     algorithm.to(device)
 
+# 我们有多个训练环境（比如Env_0是照片，Env_1是卡通）。zip(*...)把多个独立的加载器捆绑在一起。当你调用next()时，它会同时从Env_0拿一个Batch，从Env_1拿一个Batch……以此类推。
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
+# 这是一个特殊的字典。当你往里面存一个不存在的键时，它会自动创建一个空列表[]。用来存放每一个Checkpoint（检查点）的各项指标。比如记录每100步的Loss、各个环境的Accuracy等。
     checkpoint_vals = collections.defaultdict(lambda: [])
 
+# 在DomainBed中，由于不同环境的数据量不一样（有的多，有的少），“一轮（Epoch）”的定义变得模糊。这里采取了保守策略,取所有训练环境中样本量最小的那一个。
     steps_per_epoch = min([len(env)/hparams['batch_size'] for env,_ in in_splits])
 
+# n_steps：总共要跑多少步（比如 5000 步）。如果用户没在命令行指定，就用数据集默认的值。
+# checkpoint_freq：每隔多少步保存一次模型并进行全量评估。
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
 
     def save_checkpoint(filename):
+# 如果你在运行实验时加了--skip_model_save参数，这个函数会直接返回，什么都不存。
         if args.skip_model_save:
             return
         save_dict = {
@@ -220,42 +226,48 @@ if __name__ == "__main__":
             "model_hparams": hparams,
             "model_dict": algorithm.state_dict()
         }
+# 利用Python的序列化机制（Pickle），将上面那个复杂的字典转化成二进制文件,并保存到指定路径上。注意，这段代码是位于save_checkpoint内的。
         torch.save(save_dict, os.path.join(args.output_dir, filename))
 
-
+# 这个变量用于打印表头，如果是第一次允许，表头为None，即last_results_keys = None，则打印表头，例如['step', 'loss', 'acc']，并把['step', 'loss', 'acc']存入last_results_keys,在第二次验证是，会检查这个变量，如果这个变量不为空，则不打印表头。
     last_results_keys = None
-# 为什么这里要用range(start_step, n_steps)，不直接用n_steps。
+# 为什么这里要用range(start_step, n_steps)，不直接用n_steps？为了支持断点续训。
+# 在实际的科研或工业训练中，由于服务器停电、显卡任务被顶替、或者设置了最长运行时间，程序很可能在跑到一半（比如第 500 步）时突然断掉。如果代码写死成 range(n_steps)，那么每次重新启动，模型都会从第 0 步开始重练，之
     for step in range(start_step, n_steps):
         step_start_time = time.time()
+# 这是个列表推导。通过.to(device)把图片和标签从内存搬到GPU显存，并将数据存到minibatches_device里。
         minibatches_device = [(x.to(device), y.to(device))
             for x,y in next(train_minibatches_iterator)]
+# # 如果是UDA任务，还要额外抓取无标签数据。
         if args.task == "domain_adaptation":
             uda_device = [x.to(device)
                 for x,_ in next(uda_minibatches_iterator)]
         else:
             uda_device = None
+# 调用算法的更新函数。这里面包含了前向传播、计算 Loss 和反向传播（更新参数）。
         step_vals = algorithm.update(minibatches_device, uda_device)
+# 记录这步花了多久。
         checkpoint_vals['step_time'].append(time.time() - step_start_time)
-
+# 记录算法返回的各种指标。
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
-
+# 每隔checkpoint_freq步，模型就会停下来进行一次验证。
         if (step % checkpoint_freq == 0) or (step == n_steps - 1):
             results = {
                 'step': step,
                 'epoch': step / steps_per_epoch,
             }
-
+# 计算距离上次step这段时间里各种指标的的平均值。
             for key, val in checkpoint_vals.items():
                 results[key] = np.mean(val)
-
+# 遍历我们之前准备好的“全维度考场” (in, out, uda)。
             evals = zip(eval_loader_names, eval_loaders, eval_weights)
             for name, loader, weights in evals:
                 acc = misc.accuracy(algorithm, loader, weights, device)
                 results[name+'_acc'] = acc
-
+# 看看显存情况。
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
-
+# 结果展示与存档。
             results_keys = sorted(results.keys())
             if results_keys != last_results_keys:
                 misc.print_row(results_keys, colwidth=12)
@@ -274,12 +286,13 @@ if __name__ == "__main__":
 
             algorithm_dict = algorithm.state_dict()
             start_step = step + 1
+# 清空这一阶段的记录，准备迎接下一个周期的训练。
             checkpoint_vals = collections.defaultdict(lambda: [])
 
             if args.save_model_every_checkpoint:
                 save_checkpoint(f'model_step{step}.pkl')
-
+# 训练全部结束，存下最终模型。
     save_checkpoint('model.pkl')
-
+# 在输出目录创建一个叫'done'的空文件。这样sweep.py扫描时看到这个文件，就知道该任务已完成，不会再重复启动。
     with open(os.path.join(args.output_dir, 'done'), 'w') as f:
         f.write('done')

@@ -1,0 +1,104 @@
+# system prompt:
+# user prompt:
+# context:
+# experiment framework:
+# task:
+# requirements:
+# constraints:
+# best practices:
+# error handling:
+# output format:
+# examples:
+# additional:
+prompt = {
+    'system prompt':'You are an expert in deep learning and domain generalization.\
+        You specialize in domainbed framework, which is used for benchmarking domain generalization.\
+        Always provide clean, well-commented python code that integrates seamlessly with domainbed structure (e.g., using algorithms.py, datasets.py, network.py).\
+        Ensure the code is modular, follows best practices, and includes necessary imports.\
+        Do not included explanations and focus on code output.',
+    'user prompt':{
+        'context':'DomainBed is a PyTorch-based framework for benchmarking domain generalization algorithms in computer vision.\
+            It includes modules for datasets (e.g., PACS, VLCS), algorithms (e.g., ERM, IRM), networks (e.g., ResNet), and training scripts.\
+            The generated code must integrate into this structure without breaking existing functionality.',
+        'assumptions':['Dataset is pre-downloaded in ./mydatasets.',
+            'PyTorch version is 2.9.1+cu130(CUDA 13.0 enabled) and DomainBed has been cloned into the E:/CursorProject/mycode/domainbed/ directory.',
+            '',
+            ],
+        'experiment framework':'DomainBed',
+        'task':'Generate code to implement a custom deep learning model  of my own design for domain generalization on image classification(Please name the class MyModel).',
+        'requirements':['In summary, my model consists of an encoder module, a decoder and a classifier.',
+            'Assume dataset with e environments(domains).',
+            'MyModel class should inherit from the Algorithm class in algorithms.py.',
+            'The encoder module includes several private feature extractors and a single causal feature extractor.\
+            The number of private feature extractors is equal to the number of dataset environments(domains).\
+            In other words, each private feature extractor is responsible for processing data from a specific environment, while the causal feature extractor is responsible for process data from all environments.\
+            The private feature extractors and causal extractor should use the same configurable backbone type.\
+            The causal feature extractor and each private feature extractor must be independent neural networks with their own distinct sets of trainable parameters and they should not share any weights.',
+            'Since the number of environments varies across different dataset, I want my model to dynamically construct one private feature extractors for each of the e environment base on the number of environments.\
+            Additionally, please refer to datasets.py for the model input format. As I recall, input format of model is a list, and each element is a list that storage the data for a specific environment.',
+            'Refer to datasets.py to ensure the model correctly handles the input shape (e.g., channels, height, width).',
+            'The outputs of all private feature extractors should be aggregated via element-wise summation and then averaged.\
+            Finally, this average and output of causal feature extractor are processed using cross-attention serving as the input for the decoder.\
+            Additionally, the average is used as Q and K,while the output of the causal feature extractor serves as V.',
+            'Ensure all feature extractors output the same feature dimension, or use a linear layer to project them to a common space before Cross-Attention.',
+            'The output of cross-attention is used not only as input for the decoder but also as input for the classifier.',
+            'Since I intend to try differet backbone netowok, so I want backbone to be configurable via command-line parameters.\
+            I want to try ResNet, ViT, EfficientNet and AlexNet.\
+            Please implement the backbone network logic in networks.py. ResNet is already implemented in networks.py. Do not implement it again.\
+            Instead, leverage the existing ResNet classes already defined in networks.py (e.g., ResNet) to avoid code redundancy and ensure compatibility with DomainBed's standard backbones.',
+            'All encoders (one causal and e private) must share the same backbone architecture, ensuring their outputs have the same native dimension (e.g., 768 for ViT, 2048 for ResNet50).\
+            Do not force or project the output to a fixed dimension like 512.\
+            The cross-attention module must be initialized dynamically to match this native dimension.\
+            Since the classifier and decoder take the output of the cross-attention as input, they should also automatically adapt to the output dimension of cross-attention.',
+            'Implement the decoder as a symmetric mirror of the encoder to perform image reconstruction.\
+            For ResNet, EfficientNet, and AlexNet, the decoder should be a reversed architecture utilizing transpose convolutions and up-sampling layers to restore the features back to the original input image dimensions.\
+            Implement a Transformer-based reconstruction head that mirrors the encoder's embedding dimension.\
+            It should process the fused tokens and utilize a linear projection to reconstruct the output back to the original image pixel space.',
+            'The classifier should follow the architecture of a ResNet head (e.g., Global Average Pooling followed by a Linear layer).\
+            The output dimension of the classifier is the number of categories in the dataset.',
+            'In the loss function section,the loss function of my model consists of several components, including L_ERM, L_IRM, L_VREx, L_ort, L_reco and L_distance.',
+            'L_ERM is the cross-entropy loss function.\
+            L_IRM logic is already implemented in _irm_penalty method of IRM class in algorithms.py.\
+            Similary, L_VREx logic is already implemented in the VREx class in algorithms.py.\
+            L_reco is the construction loss, implemented using the MSE loss function.\
+            L_ort is the different loss from Doamin Seperate Netowrk, which ensures that each private feature extractor learns distinct feature.\
+            Since the private feature from different environments are distinct, I want to use L_ort to guide the extraction of private features.',
+            'L_distance is defined as the average distance between the private features of each environment and their corresponding environment prototypes.\
+            An environment prototype is the mean vector of all samples from that environment in the feature space, updated via a weighted moving average.\
+            This loss mimics an energy-based mechanism to address the issue of unbalanced sample sizes across environments.\
+            In practice, the process operates at the batch level: first, we calculate the prototype for each environment.\
+            Then, we compute the distance between the prototype and its respective private features.\
+            These distances are summed and averaged to produce L_distance.\
+            Between batches, the update of the prototype is achieved through exponential moving average.\
+            This is grounded in the intuition that smaller distances (lower energy) signify that the model is familiar with the features, while larger distances (higher energy) indicate poorer feature extraction or unfamiliarity.',
+            'The environment prototypes must be persistent across batches.\
+            Please register them as model buffers using self.register_buffer instead of local variables in the update method.\
+            This ensures they are correctly moved to the assigned device (GPU/CPU) and included in the model's state_dict for saving and loading.',
+            'Implement each loss function as a standalone method within the class.\
+            The total loss should be computed by summing the outputs of these individual loss methods to ensure a modular and maintainable code structure',
+            'Given that L_IRM, L_VREx, and L_ort exhibit an antagonistic relationship, we employ homoscedastic uncertainty weighting to dynamically balance these terms.\
+            Furthermore, this automated weighting scheme is also applied to L_ERM and L_reco to ensure task-wise gradient stability.\
+            The weight of L_distance is manually.',
+            'The model should iterate through the list of minibatches, using the index to select the corresponding private feature extractor.',],
+        'constraints':'Do not modify DomainBed's core files like train.py or existing algorithms.py classes.\
+        Only add new classes or functions. Ensure the model handles variable number of environments (e) dynamically without hardcoding.\
+        Limit model complexity to avoid excessive memory usage (e.g., no more than 2x ResNet parameters). Do not use external libraries beyond DomainBed's requirements (e.g., torch, torchvision).\
+        During the process of reading the code, please ignore the comments within it.',
+        'best practices':'',
+        'error handling':'Add try-except blocks for data loading (e.g., handle mismatched environment counts).\
+        Validate inputs: assert n_environments > 0, check backbone type via if-elif.\
+        Handle CUDA availability: use torch.device('cuda' if torch.cuda.is_available() else 'cpu').\
+        For loss terms, add checks to avoid NaN (e.g., clip gradients if needed).\
+        Provide meaningful error messages, e.g., raise ValueError('Invalid backbone: choose from ResNet, ViT, EfficientNet, AlexNet').\
+        In prototype updates, handle empty batches with fallback to zero vectors.',
+        'output format:'Section 1: Imports and setup (global imports for all files).\
+        Section 2: Backbone implementations in networks.py (for ViT, EfficientNet, AlexNet; exclude ResNet).\
+        Section 3: Decoder implementations in networks.py (reversed versions matching backbones).\
+        Section 4: MyModel class definition in algorithms.py (including encoder, decoder, classifier, loss functions). Hyperparameter registration in hparams_registry.py (e.g., for backbone type)',
+        'examples':'',
+        'additional':'Keep code concise; focus on core logic without unnecessary prints or tests.\
+        If ambiguities in requirements (e.g., exact reversed decoder for EfficientNet), default to standard PyTorch implementations from torchvision.\
+        Ensure all loss terms (L_ERM, L_IRM, etc.) are computed in the update method. For command-line config: use hparams['backbone'] to select network.\
+        Output only code; no external explanations.',
+    }
+}

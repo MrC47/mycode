@@ -4,10 +4,10 @@ from datasets import load_dataset
 
 def download_and_restore_pacs(cache_dir = './datasets_cache', save_dir = './mydatasets/pacs'):
 
-    pacs = load_dataset(path = '/flwrlabs/pacs',
+    pacs = load_dataset(path = 'flwrlabs/pacs',
                         cache_dir = cache_dir)
 
-    label_name = pacs['train'].features['label'].name
+    label_name = pacs['train'].features['label'].names
     domain_name = ['photo','art_painting','cartoon','sketch']
 
     for i, item in enumerate(tqdm(pacs['train'],desc = '正在还原图片')):

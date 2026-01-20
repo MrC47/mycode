@@ -57,6 +57,7 @@ ALGORITHMS = [
     'RDM',
     'ADRMX',
     'URM',
+    'MyModel',
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -2635,3 +2636,387 @@ class ADRMX(Algorithm):
     
     def predict(self, x):
         return self.network(x)
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8):
+        super(CrossAttention, self).__init__()
+        # 输入特征的总维度（例如 Vit 是 768）
+        self.embed_dim = embed_dim
+        # 多头注意力的“头”数
+        self.num_heads = num_heads
+        # 每个头分配到的维度（768/8 = 96）
+        self.head_dim = embed_dim // num_heads
+        
+        # 确保总维度能被头数整除，否则特征对齐会出错
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        
+        # 定义四个线性变换矩阵（投影层）
+        self.q_proj = nn.Linear(embed_dim, embed_dim) # 把 Query 投影到新空间
+        self.k_proj = nn.Linear(embed_dim, embed_dim) # 把 Key 投影到新空间 
+        self.v_proj = nn.Linear(embed_dim, embed_dim) # 把 Value 投影到新空间
+        self.out_proj = nn.Linear(embed_dim, embed_dim) # 最后输出前的融合层
+        
+    def forward(self, q, k, v):
+        # get batchsize
+        B = q.size(0)
+        
+        # for robustness :when q, k, and v are 2-dimension tensorsl(B, C),expand them to 3-dimension (B, 1, C)
+        if q.dim() == 2:
+            q = q.unsqueeze(1)
+        if k.dim() == 2:
+            k = k.unsqueeze(1)
+        if v.dim() == 2:
+            v = v.unsqueeze(1)
+       # perform linear projection 
+        q = self.q_proj(q)
+        k = self.k_proj(k)
+        v = self.v_proj(v)
+        
+        # get the sequence lengths of q, k and v
+        num_q_tokens = q.size(1)
+        num_k_tokens = k.size(1)
+        num_v_tokens = v.size(1)
+          
+        # 1. view: (B, N, C) -> (B, N, heads, head_dim) split heads for multi-head attention 
+        # 2. transpose(1, 2): -> (B, heads, N, head_dim)
+        # shape (B, N, C) is equivalent to (B, S, E) in other notation
+        # transpose for multi-head attention: (B, N, heads, head_dim) -> (B, heads, N, head_dim)
+        # this enables batched matrix multiplication across heads
+        q = q.view(B, num_q_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, num_k_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, num_v_tokens, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # compute attention score
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        attn_output = torch.matmul(attn_weights, v)
+        # restore original dimension order
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        
+        if num_q_tokens == 1:
+            attn_output = attn_output.view(B, 1, self.embed_dim)
+            output = self.out_proj(attn_output)
+            return output.squeeze(1)
+        else:
+            attn_output = attn_output.view(B, num_q_tokens, self.embed_dim)
+            output = self.out_proj(attn_output)
+            # Returns tensor with sequence shape (B, N, C)
+            return output
+
+
+class MyModel(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(MyModel, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        assert num_domains > 0, "Number of domains must be greater than 0"
+
+        backbone_type = hparams.get('backbone', 'ResNet')
+        if backbone_type not in ['ResNet', 'ViT', 'EfficientNet', 'AlexNet']:
+            raise ValueError('Invalid backbone: choose from ResNet, ViT, EfficientNet, AlexNet')
+
+        self.backbone_type = backbone_type
+        self.num_domains = num_domains
+        self.input_shape = input_shape # (3, 224, 224)
+
+        if backbone_type == 'ResNet':
+            from domainbed.networks import ResNet
+            backbone_class = ResNet
+        elif backbone_type == 'ViT':
+            from domainbed.networks import ViT
+            backbone_class = ViT
+        elif backbone_type == 'EfficientNet':
+            from domainbed.networks import EfficientNet
+            backbone_class = EfficientNet
+        elif backbone_type == 'AlexNet':
+            from domainbed.networks import AlexNet
+            backbone_class = AlexNet
+
+        self.causal_extractor = backbone_class(input_shape, hparams)
+        feature_dim = self.causal_extractor.n_outputs
+
+        self.private_extractors = nn.ModuleList([
+            backbone_class(input_shape, hparams) for _ in range(num_domains)
+        ])
+
+        self.cross_attention = CrossAttention(feature_dim)
+
+        if backbone_type == 'ResNet':
+            from domainbed.networks import ResNetDecoder
+            decoder_class = ResNetDecoder
+            self.decoder = decoder_class(feature_dim, input_shape, hparams)
+        elif backbone_type == 'ViT':
+            from domainbed.networks import ViTDecoder
+            decoder_class = ViTDecoder
+            self.decoder = decoder_class(feature_dim, input_shape, hparams)
+        elif backbone_type == 'EfficientNet':
+            from domainbed.networks import EfficientNetDecoder
+            decoder_class = EfficientNetDecoder
+            spatial_h = getattr(self.causal_extractor, 'spatial_h', 7)
+            spatial_w = getattr(self.causal_extractor, 'spatial_w', 7)
+            self.decoder = decoder_class(feature_dim, input_shape, hparams, spatial_h, spatial_w)
+        elif backbone_type == 'AlexNet':
+            from domainbed.networks import AlexNetDecoder
+            decoder_class = AlexNetDecoder
+            spatial_h = getattr(self.causal_extractor, 'spatial_h', 6)
+            spatial_w = getattr(self.causal_extractor, 'spatial_w', 6)
+            self.decoder = decoder_class(feature_dim, input_shape, hparams, spatial_h, spatial_w)
+
+        self.classifier = networks.Classifier(
+            feature_dim,
+            num_classes,
+            self.hparams.get('nonlinear_classifier', False)
+        )
+
+        self.register_buffer('prototypes', torch.zeros(num_domains, feature_dim))
+        self.register_buffer('update_count', torch.tensor([0]))
+
+        self.is_vit = (backbone_type == 'ViT')
+        self.is_multi_token = (backbone_type in ['ViT', 'EfficientNet', 'AlexNet'])
+
+        # Homoscedastic uncertainty parameters
+        self.log_sigma_erm = nn.Parameter(torch.zeros(1))
+        self.log_sigma_irm = nn.Parameter(torch.zeros(1))
+        self.log_sigma_vrex = nn.Parameter(torch.zeros(1))
+        self.log_sigma_ort = nn.Parameter(torch.zeros(1))
+        self.log_sigma_reco = nn.Parameter(torch.zeros(1))
+
+        self._setup_optimizer()
+
+    def _setup_optimizer(self):
+        params = list(self.parameters())
+        self.optimizer = torch.optim.Adam(
+            params,
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+    def _pool_features(self, features):
+        # Compatible ResNet/CNN: [B, C, H, W] -> [B, C]
+        if features.dim() == 4:
+            return features.mean(dim=[2, 3])
+        
+        # Compatible ViT: [B, 197, 768] -> [B, 768]
+        if features.dim() == 3:
+            if self.is_vit:
+                return features[:, 0] 
+            return features.mean(dim=1)
+            
+        return features
+
+    def _get_feature_for_attention(self, features):
+        if features.dim() == 3:
+            return features
+        return features.unsqueeze(1)
+    
+    def loss_erm(self, logits, labels):
+        return F.cross_entropy(logits, labels)
+    
+    def loss_irm(self, logits, labels):
+        return IRM._irm_penalty(logits, labels)
+    
+    def loss_vrex(self, logits_list, labels_list):
+        losses = torch.stack([F.cross_entropy(logits, labels) 
+                             for logits, labels in zip(logits_list, labels_list)])
+        mean = losses.mean()
+        penalty = ((losses - mean) ** 2).mean()
+        return penalty
+    
+    def loss_ort(self, private_features_list, causal_features_raw):
+        device = causal_features_raw.device
+        if len(private_features_list) == 0:
+            return torch.tensor(0.0).to(device=device)
+
+        diff_loss = torch.tensor(0.0, device=device)
+        count = 0
+
+        f_causal_all = F.normalize(self._pool_features(causal_features_raw), p=2, dim=1)
+
+        priv_norm_list = [
+            F.normalize(self._pool_features(f_priv), p=2, dim=1)
+            for f_priv in private_features_list
+        ]
+
+        start_idx = 0
+        for f_priv_norm in priv_norm_list:
+            batch_size = f_priv_norm.size(0)
+            f_causal_part = f_causal_all[start_idx : start_idx + batch_size]
+
+            diff_loss += torch.mean(torch.sum(f_causal_part * f_priv_norm, dim=1)**2)
+
+            start_idx += batch_size
+            count += 1
+
+        num_envs = len(priv_norm_list)
+        if num_envs > 1:
+            for i in range(num_envs):
+                for j in range(i + 1, num_envs):
+                    f_i_proto = priv_norm_list[i].mean(dim=0)
+                    f_j_proto = priv_norm_list[j].mean(dim=0)
+
+                    diff_loss += torch.sum(f_i_proto * f_j_proto)**2
+                    count += 1
+
+        return diff_loss / count if count > 0 else diff_loss
+    
+    def loss_reco(self, reconstructed, original):
+        return F.mse_loss(reconstructed, original)
+    
+    def loss_distance(self, private_features_list, domain_indices, alpha=0.9):
+        if len(private_features_list) == 0:
+            return torch.tensor(0.0).to(self.prototypes.device)
+
+        device = self.prototypes.device
+        total_distance = torch.tensor(0.0, device=device)
+        count = 0
+
+        for idx, features in zip(domain_indices, private_features_list):
+            if features.size(0) == 0:
+                continue
+
+            features_pooled = self._pool_features(features)
+
+            batch_prototype = features_pooled.mean(dim=0)
+
+            with torch.no_grad():
+                if self.prototypes[idx].abs().sum() == 0:
+                    self.prototypes[idx].copy_(batch_prototype)
+                else:
+                    new_proto = alpha * self.prototypes[idx] + (1 - alpha) * batch_prototype
+                    self.prototypes[idx].copy_(new_proto)
+
+            target_proto = self.prototypes[idx].detach().unsqueeze(0) # 维度 (1, C)
+
+            dist = torch.norm(features_pooled - target_proto, p=2, dim=1).mean()
+
+            total_distance += dist
+            count += 1
+
+        return total_distance / count if count > 0 else total_distance
+    
+    def uncertainty_loss(self, loss, log_sigma):
+        return torch.exp(-log_sigma) * loss + log_sigma
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if torch.cuda.is_available() and minibatches[0][0].is_cuda else "cpu"
+
+        if len(minibatches) != self.num_domains:
+            raise ValueError(f"Mismatched environment count: expected {self.num_domains}, got {len(minibatches)}")
+
+        all_x = []
+        all_y = []
+        private_features_list = []
+        domain_indices = []
+
+        for env_idx, (x, y) in enumerate(minibatches):
+            if x.size(0) == 0:
+                continue
+
+            all_x.append(x)
+            all_y.append(y)
+            domain_indices.append(env_idx)
+
+            private_encoder = self.private_extractors[env_idx](x)
+            private_features_list.append(private_encoder)
+
+        all_x_cat = torch.cat(all_x)
+        all_y_cat = torch.cat(all_y)
+
+        causal_features_raw = self.causal_extractor(all_x_cat)
+
+        # Aggregate private features via element-wise summation and averaging
+        if len(private_features_list) > 0:
+            # Pool all private features first to ensure consistent dimensions
+            private_pooled_list = [self._pool_features(feat) for feat in private_features_list]
+            private_sum = torch.stack(private_pooled_list).sum(dim=0)
+        else:
+            private_sum = self._pool_features(causal_features_raw)
+
+        # Process causal features for attention
+        causal_features = self._get_feature_for_attention(causal_features_raw)
+        private_avg_attn = self._get_feature_for_attention(private_sum)
+
+        # Cross-attention: private features as query, causal features as key/value
+        fused_features = self.cross_attention(private_avg_attn, causal_features, causal_features)
+        
+        if self.is_vit:
+            latent_for_clf = fused_features[:, 0]
+            latent_for_reco = fused_features[:, 1:]
+        else:
+            latent_for_clf = self._pool_features(fused_features)
+            latent_for_reco = fused_features
+
+        logits = self.classifier(latent_for_clf)
+        reconstructed = self.decoder(latent_for_reco)
+
+        original_images = all_x_cat
+        if original_images.min() < 0:
+            original_images = (original_images + 1) / 2
+
+        l_erm = self.loss_erm(logits, all_y_cat)
+
+        # Prepare logits and labels for per-environment losses
+        logits_list = []
+        labels_list = []
+        start_idx = 0
+        for x, y in zip(all_x, all_y):
+            end_idx = start_idx + x.size(0)
+            logits_list.append(logits[start_idx:end_idx])
+            labels_list.append(y)
+            start_idx = end_idx
+
+        l_irm = self.loss_irm(logits, all_y_cat)
+        l_vrex = self.loss_vrex(logits_list, labels_list)
+        l_ort = self.loss_ort(private_features_list, causal_features_raw)
+        l_reco = self.loss_reco(reconstructed, original_images)
+        l_distance = self.loss_distance(private_features_list, domain_indices)
+
+        
+        weight_distance = self.hparams.get('distance_weight', 1.0)
+
+        # Homoscedastic uncertainty weighting
+        total_loss = (self.uncertainty_loss(l_erm, self.log_sigma_erm) +
+                self.uncertainty_loss(l_irm, self.log_sigma_irm) +
+                self.uncertainty_loss(l_vrex, self.log_sigma_vrex) +
+                self.uncertainty_loss(l_ort, self.log_sigma_ort) +
+                self.uncertainty_loss(l_reco, self.log_sigma_reco) +
+                weight_distance * l_distance)
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        self.update_count += 1
+
+        return {
+            'loss': total_loss.item(),
+            'l_erm': l_erm.item(),
+            'l_irm': l_irm.item() if isinstance(l_irm, torch.Tensor) else l_irm,
+            'l_vrex': l_vrex.item() if isinstance(l_vrex, torch.Tensor) else l_vrex,
+            'l_ort': l_ort.item() if isinstance(l_ort, torch.Tensor) else l_ort,
+            'l_reco': l_reco.item(),
+            'l_distance': l_distance.item() if isinstance(l_distance, torch.Tensor) else l_distance,
+        }
+    
+    def predict(self, x):
+        # Since  private feature encoder cannot bu used during testing, use causal features as replacement 
+        with torch.no_grad():
+            causal_features_raw = self.causal_extractor(x)
+            causal_features = self._get_feature_for_attention(causal_features_raw)
+
+            # For prediction, use causal features as both private and causal
+            private_avg = self._pool_features(causal_features_raw)
+            private_avg_attn = self._get_feature_for_attention(private_avg)
+
+            # Cross-attention: private features as query, causal features as key/value
+            fused_features = self.cross_attention(private_avg_attn, causal_features, causal_features)
+            
+            if self.is_vit:
+                latent_for_clf = fused_features[:, 0]
+            else:
+                latent_for_clf = self._pool_features(fused_features)
+
+            logits = self.classifier(latent_for_clf)
+            return logits

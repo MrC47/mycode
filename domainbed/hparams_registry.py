@@ -221,6 +221,10 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('mlp_depth', 9, lambda r: int(r.choice([8, 9, 10])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0]))
 
+    elif algorithm == "MyModel":
+        _hparam('backbone', 'ResNet', lambda r: r.choice(['ResNet', 'ViT', 'EfficientNet', 'AlexNet']))
+        _hparam('distance_weight', 1.0, lambda r: 10**r.uniform(-1, 1))
+
 
     # Dataset-and-algorithm-specific hparam definitions. Each block of code
     # below corresponds to exactly one hparam. Avoid nested conditionals.

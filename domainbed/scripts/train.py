@@ -79,6 +79,7 @@ if __name__ == "__main__":
         hparams = hparams_registry.random_hparams(args.algorithm, args.dataset,
             misc.seed_hash(args.hparams_seed, args.trial_seed))
     if args.hparams:
+        # 增量更新，手动传参时，只传需要的就行。update方法来自字典。
         hparams.update(json.loads(args.hparams))
 
     print('HParams:')

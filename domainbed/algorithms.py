@@ -2736,8 +2736,9 @@ class MyModel(Algorithm):
         self.causal_extractor = backbone_class(input_shape, hparams)
         feature_dim = self.causal_extractor.n_outputs
 
-        self.private_extractors = nn.ModuleList([
-            backbone_class(input_shape, hparams) for _ in range(num_domains)
+        self.shared_private_extractor = backbone_class(input_shape, hparams)
+        self.private_heads = nn.ModuleList([
+            networks.PrivateHead(feature_dim, hparams) for _ in range(num_domains)
         ])
 
         self.cross_attention = CrossAttention(feature_dim)
@@ -2903,7 +2904,30 @@ class MyModel(Algorithm):
 
         if len(minibatches) != self.num_domains:
             raise ValueError(f"Mismatched environment count: expected {self.num_domains}, got {len(minibatches)}")
+        # private_encoder的一次性推理版本。
+        # all_x = [x for x, y in minibatches]
+        # all_y = [y for x, y in minibatches]
+        # all_x_cat = torch.cat(all_x)
+        # all_y_cat = torch.cat(all_y)
+        # causal_features_raw = self.causal_extractor(all_x_cat)
+        # shared_priv_all = self.shared_private_extractor(all_x_cat)
+        # private_features_list = []
+        # domain_indices = []
+        # start_idx = 0
 
+        # for env_idx, x in enumerate(all_x):
+        #     batch_size = x.size(0)
+        #     end_idx = start_idx + batch_size
+            
+            # 从全量特征中切出属于当前域的部分
+        #    env_priv_base = shared_priv_all[start_idx:end_idx]
+            
+            # 通过专用头 (BN + Adapter)
+        #    p_feat = self.private_heads[env_idx](env_priv_base)
+            
+        #    private_features_list.append(p_feat)
+        #    domain_indices.append(env_idx)
+        #   start_idx = end_idx
         all_x = []
         all_y = []
         private_features_list = []
@@ -2913,12 +2937,14 @@ class MyModel(Algorithm):
             if x.size(0) == 0:
                 continue
 
+            private_features = self.shared_private_extractor(x)
+
             all_x.append(x)
             all_y.append(y)
             domain_indices.append(env_idx)
 
-            private_encoder = self.private_extractors[env_idx](x)
-            private_features_list.append(private_encoder)
+            private_head = self.private_heads[env_idx](private_features)
+            private_features_list.append(private_head)
 
         all_x_cat = torch.cat(all_x)
         all_y_cat = torch.cat(all_y)

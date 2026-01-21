@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from turtle import forward
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -285,8 +286,26 @@ class WholeFish(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class PrivateHead(nn.Module):
+    def __init__(self, input_shape, hparams):
+        super(PrivateHead, self).__init__()
 
-class ViT(torch.nn.Module):
+        self.bn = nn.BatchNorm1d(input_shape)
+
+        self.adapter = MLP(input_shape, input_shape, hparams)
+    def forward(self, x):
+        #(B, N, C)
+        identity = x
+        if x.dim() == 3:
+            x = x.transpose(1, 2)
+            x = self.bn(x)
+            x = x.transpose(1, 2)
+        else:
+            x = self.bn(x)
+        x = self.adapter(x)
+        return identity + x
+
+class ViT(nn.Module):
     def __init__(self, input_shape, hparams):
         super(ViT, self).__init__()
         # 在 PyTorch 的神经网络模型中，input_shape 通常不包含 Batch Size。它指的是单张图像的维度
@@ -321,7 +340,7 @@ class ViT(torch.nn.Module):
             return self.activation(self.dropout(x))
 
 
-class EfficientNet(torch.nn.Module):
+class EfficientNet(nn.Module):
     def __init__(self, input_shape, hparams):
         super(EfficientNet, self).__init__()
         nc = input_shape[0]
@@ -371,7 +390,7 @@ class EfficientNet(torch.nn.Module):
         return x
 
 
-class AlexNet(torch.nn.Module):
+class AlexNet(nn.Module):
     def __init__(self, input_shape, hparams):
         super(AlexNet, self).__init__()
         nc = input_shape[0]

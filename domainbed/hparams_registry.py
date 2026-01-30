@@ -223,7 +223,8 @@ def _hparams(algorithm, dataset, random_seed):
 
     elif algorithm == "MyModel":
         _hparam('backbone', 'ResNet', lambda r: r.choice(['ResNet', 'ViT', 'EfficientNet', 'AlexNet']))
-        _hparam('distance_weight', 1.0, lambda r: 10**r.uniform(-1, 1))
+        _hparam('alexnet', False, lambda r: False)
+        _hparam('efficientnet', False, lambda r: False)
         _hparam('mlp_width', 256, lambda r: r.choice([256, 512]))
         _hparam('mlp_depth', 2, lambda r: int(r.choice([2, 3])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0., 0.1]))
@@ -260,7 +261,7 @@ def _hparams(algorithm, dataset, random_seed):
     elif dataset == 'DomainNet':
         _hparam('batch_size', 32, lambda r: int(2**r.uniform(3, 5)))
     else:
-        _hparam('batch_size', 32, lambda r: int(2**r.uniform(3, 5.5)))
+        _hparam('batch_size', 4, lambda r: int(2**r.uniform(3, 5.5)))
 
     if algorithm in ['DANN', 'CDANN'] and dataset in SMALL_IMAGES:
         _hparam('lr_g', 1e-3, lambda r: 10**r.uniform(-4.5, -2.5))

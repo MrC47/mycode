@@ -2715,9 +2715,14 @@ class MyModel(Algorithm):
         self.private_heads = nn.ModuleList([
             networks.PrivateHead(self.shared_private_extractor.n_outputs, hparams) for _ in range(num_domains)
         ])
-        self.cross_attention = CrossAttention(self.causal_extractor.n_outputs)
+        self.gate = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.ReLU(),
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.Sigmoid()
+        )
 
-        self.decoder = networks.Decoder(self.feature_dim, self.input_shape, self.hparams)
+        self.decoder = networks.Decoder(self.feature_dim * 2, self.input_shape, self.hparams)
 
         self.classifier = networks.Classifier(
             self.feature_dim,
@@ -2774,52 +2779,31 @@ class MyModel(Algorithm):
         return penalty
    
     def loss_ort(self, private_features_list, causal_features_raw):
-        """
-        计算因果特征与私有特征的正交性损失 (Orthogonality Loss)。
-        目标：使因果特征 (Causal) 与私有特征 (Private) 互不相关。
-        """
-        device = causal_features_raw.device
+        # 1. 提取并池化特征
+        f_causal = self._pool_features(causal_features_raw) # [B_total, D]
         
-        # 边界检查：如果没有私有特征，直接返回 0
-        if len(private_features_list) == 0:
-            return torch.tensor(0.0).to(device=device)
-
-        # 1. 全局预处理因果特征
-        # _pool_features 负责将 (B, C, H, W) 展平为 (B, Dim)
-        # F.normalize 做 L2 归一化，这对计算余弦相似度至关重要
-        # 归一化后，向量模长为 1，点积结果即为余弦值，范围 [-1, 1]
-        f_causal_all = F.normalize(self._pool_features(causal_features_raw), p=2, dim=1)
-        
-        ortho_loss = torch.tensor(0.0, device=device)
+        total_diff_loss = torch.tensor(0.0).to(f_causal.device)
         start_idx = 0
-
-        # 2. 逐域计算正交性
+        
         for f_priv in private_features_list:
             batch_size = f_priv.size(0)
+            # 对应当前域的因果特征
+            f_c_part = f_causal[start_idx : start_idx + batch_size]
+            f_s_part = self._pool_features(f_priv)
             
-            # A. 切片：获取当前域对应的因果特征 (Batch, Dim)
-            f_causal_part = f_causal_all[start_idx : start_idx + batch_size]
+            # 2. 【DSN 标准 Difference Loss】
+            # 计算特征矩阵的乘积：[D, B] * [B, D] -> [D, D]
+            # 这衡量了特征维度之间的相关性，符合 DSN 原始定义的矩阵范数约束
+            correlation_matrix = torch.matmul(f_c_part.t(), f_s_part)
             
-            # B. 预处理：当前域的私有特征 (Batch, Dim) 并归一化
-            f_priv_norm = F.normalize(self._pool_features(f_priv), p=2, dim=1)
+            # 3. 计算 Frobenius 范数的平方，并归一化
+            # 这种方式比单个样本的点积要“软”，因为它是在优化整个 Batch 的相关性分布
+            diff_loss = torch.mean(correlation_matrix ** 2)
             
-            # C. 计算相关性矩阵 (Correlation Matrix)
-            # 形状变化: (Dim, Batch) @ (Batch, Dim) -> (Dim, Dim)
-            # 结果: Matrix[i, j] 代表 Causal第i维 与 Private第j维 的相关程度
-            # 关键点: 除以 batch_size，消除 batch 大小对数值的影响
-            correlation_matrix = torch.matmul(f_causal_part.t(), f_priv_norm) / batch_size
-            
-            # D. 计算 Frobenius 范数的平方并取平均 (核心修改)
-            # (correlation_matrix ** 2) 将所有相关性转为正值 (0~1之间)
-            # .mean() 对 Dim*Dim 个元素取平均，而不是求和
-            # 作用: 无论特征维度是 512 还是 2048，Loss 的量级都保持在 0~1 之间
-            ortho_loss += (correlation_matrix ** 2).mean()
-            
-            # 更新索引
+            total_diff_loss += diff_loss
             start_idx += batch_size
-
-        # 3. 对域数量取平均
-        return ortho_loss / len(private_features_list)
+            
+        return total_diff_loss / len(private_features_list)
    
     def loss_reco(self, reconstructed, original):
         return F.mse_loss(reconstructed, original)
@@ -2883,8 +2867,11 @@ class MyModel(Algorithm):
         all_x = [x for x, y in minibatches]
         all_y = [y for x, y in minibatches]
         all_x_cat = torch.cat(all_x)
+        all_y_cat = torch.cat(all_y)
+
         causal_features_raw = self.causal_extractor(all_x_cat)
         shared_priv_all = self.shared_private_extractor(all_x_cat)
+
         private_features_list = []
         domain_indices = []
         start_idx = 0
@@ -2901,65 +2888,52 @@ class MyModel(Algorithm):
             private_features_list.append(p_feat)
             domain_indices.append(env_idx)
             start_idx = end_idx
-        # Aggregate private features via element-wise summation and averaging
+
         dynamic_weights, all_sample_energies = self.get_energy_weights(private_features_list, domain_indices)
         if len(private_features_list) > 0:
-            # Pool all private features first to ensure consistent dimensions
             private_cat = torch.cat(private_features_list)
         else:
             private_cat = causal_features_raw
-        # Process causal features for attention
-        causal_features = self._get_feature_for_attention(causal_features_raw)
-        private_avg_attn = self._get_feature_for_attention(self._pool_features(private_cat))
-        # Cross-attention: private features as query, causal features as key/value
-        fused_features = self.cross_attention(private_avg_attn, causal_features, causal_features)
-       
+
+        f_p = self._pool_features(private_cat)
+        gate_weights = self.gate(f_p)
+
+        f_c = self._pool_features(causal_features_raw)
+        f_fused_vec = f_c + gate_weights * f_p
         if self.hparams['vit']:
-            latent_for_clf = fused_features[:, 0]
-            latent_for_reco = fused_features[:, 1:]
+            latent_for_reco = torch.cat([causal_features_raw, private_cat], dim=2)
         else:
-            latent_for_clf = self._pool_features(fused_features)
-            latent_for_reco = fused_features
-        logits = self.classifier(latent_for_clf)
+            latent_for_reco = torch.cat([causal_features_raw, private_cat], dim=1)
+        logits = self.classifier(f_fused_vec)
         reconstructed = self.decoder(latent_for_reco)
         mean = torch.tensor([0.485, 0.456, 0.406]).to(device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).to(device).view(1, 3, 1, 1)
         original_images = all_x_cat * std + mean
         original_images = torch.clamp(original_images, 0, 1)
-        # Prepare logits and labels for per-environment losses
-        l_irm_list = []
-        l_ort_list = []
+
         logits_list = []
         labels_list = []
-        f_causal_norm_all = F.normalize(self._pool_features(causal_features_raw), p=2, dim=1)
         start_idx = 0
-        for i, (x, y) in enumerate(zip(all_x, all_y)):
+        for (x, y) in zip(all_x, all_y):
             end_idx = start_idx + x.size(0)
             env_logits = logits[start_idx:end_idx]
-            l_irm_list.append(dynamic_weights[i] * self.loss_irm(env_logits, y))
-            f_c_part = f_causal_norm_all[start_idx:end_idx]
-            f_p_part = F.normalize(self._pool_features(private_features_list[i]), p=2, dim=1)
-            corr_mat = torch.mm(f_c_part.t(), f_p_part)
-            ortho_loss = torch.sum(corr_mat.pow(2))
-            ortho_loss_scaled = ortho_loss / self.causal_extractor.n_outputs
-            l_ort_list.append(dynamic_weights[i] * ortho_loss_scaled)
             logits_list.append(env_logits)
             labels_list.append(y)
             start_idx = end_idx
            
-        l_erm = self.loss_erm(torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0))
-        l_irm = torch.stack(l_irm_list).sum() / self.num_domains
+        l_erm = self.loss_erm(logits, all_y_cat)
+        l_irm = self.loss_irm(logits, all_y_cat)
         l_vrex = self.loss_vrex(logits_list, labels_list)
-        l_ort = torch.stack(l_ort_list).sum() / self.num_domains
+        l_ort = self.loss_ort(private_features_list, causal_features_raw)
         l_reco = self.loss_reco(reconstructed, original_images)
         l_energy = self.loss_energy(torch.cat(all_sample_energies), gamma=1.0)
        
 
         # --- GradNorm 核心逻辑 (优化版) ---
-        shared_params = list(self.classifier.parameters())  # 只看最后5层足矣，减少计算量
         # 仅在训练稳定后开启 (例如 step > 100)，或者每 N 步更新一次
         if self.update_count > 100 and self.update_count % 10 == 0:
            
+            shared_params = list(self.causal_extractor.parameters())[-2:]
             # 1. 计算各任务的梯度范数 (G_i)
             task_norms = []
             # 这里的 losses 字典需要包含加权后的 loss 还是原始 loss?
@@ -2997,7 +2971,7 @@ class MyModel(Algorithm):
             # 如果不计算 Loss 里的下降速率 r_i，直接平衡梯度：
             # 目标：希望 G_i 接近 mean_norm
            
-            target_ratios = mean_norm / (task_norms + 1e-6)
+            target_ratios = norm_erm / (task_norms + 1e-6)
            
             # 4. 动量更新权重 (关键：防止震荡)
             # 使用 detach() 确保不反向传播给权重自己
@@ -3009,7 +2983,9 @@ class MyModel(Algorithm):
             new_weights = new_weights * normalize_coeff
            
             # 6. 赋值与截断
-            new_weights = torch.clamp(new_weights, 0.01, 20.0)  # 放宽上限
+            new_weights = torch.clamp(new_weights, 0.02, 10.0)  # 放宽上限
+            new_weights[4] = torch.clamp(new_weights[4], max=1.5) # 限制能量损失权重
+            new_weights[2] = torch.clamp(new_weights[2], min=0.5) # 保护正交损失权重
             self.task_weights.data.copy_(new_weights)
 
         # 最终总损失计算
@@ -3044,14 +3020,17 @@ class MyModel(Algorithm):
         self.eval()
         # Since private feature encoder cannot bu used during testing, use causal features as replacement
         with torch.no_grad():
-            causal_features_raw = self.causal_extractor(x)
-            kv = self._get_feature_for_attention(causal_features_raw)
-            # For prediction, use causal features as both private and causal
-            private_features_raw = self.prototypes.mean(dim=0).unsqueeze(0).expand(x.size(0), -1)
-            q = self._get_feature_for_attention(private_features_raw)
-            # Cross-attention: private features as query, causal features as key/value
-            fused_features = self.cross_attention(q, kv, kv)
-           
-            latent_for_clf = fused_features.squeeze(1)
-            logits = self.classifier(latent_for_clf)
-            return logits
+            # 1. 提取因果特征
+            f_c_raw = self.causal_extractor(x)
+            f_c_vec = self._pool_features(f_c_raw)
+            
+            # 2. 使用原型 (Prototype) 模拟平均私有特征
+            # 或者简单地：在测试集不使用私有修正，只靠因果预测
+            # 这里推荐使用原型，以保持输入分布的一致性
+            f_p_mock = self.prototypes.mean(dim=0).unsqueeze(0).expand(x.size(0), -1)
+            
+            # 3. 门控自适应过滤
+            gate_weights = self.gate(f_p_mock)
+            f_fused_vec = f_c_vec + gate_weights * f_p_mock
+            
+            return self.classifier(f_fused_vec)

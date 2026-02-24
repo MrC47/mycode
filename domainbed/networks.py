@@ -150,10 +150,11 @@ class ResNet(torch.nn.Module):
         self.activation = nn.Identity() # for URM; does not affect other algorithms
 
     def forward(self, x):
-        x = self.network(x)[-1]
-        # 1. flatten(2): (B, C, H*W) -> flatten 7x7 into 49
-        # 2. transpose(1, 2): (B, 49, C) -> convert to token squence format 
-        x = x.flatten(2).transpose(1, 2)
+        if self.hparams['resnet50_augmix']:
+            x = self.network(x)[-1]
+        else:
+            x = self.network(x)
+        # x.shape = (B, C, H, W)
         return self.activation(self.dropout(x))
 
     def train(self, mode=True):
@@ -308,56 +309,31 @@ class WholeFish(nn.Module):
 class PrivateHead(nn.Module):
     def __init__(self, input_dim, hparams):
         super(PrivateHead, self).__init__()
+        # input_dim 对于 ResNet50 是 2048
         
-        # 设定组数 (通常视觉特征 32 组是标配)
         num_groups = 32
+        mid_dim = input_dim // 4  # 适当收缩维度，减少显存占用
         
-        # 确保中间维度能被组数整除
-        mid_dim = (input_dim // 2 // num_groups) * num_groups
-        # 瓶颈层收紧到 1/8，并确保整除
-        hidden_dim = (input_dim // 8 // num_groups) * num_groups
-        if hidden_dim < num_groups: # 防止维度过小时报错
-            hidden_dim = num_groups
-
-        # 初始输入归一化
-        self.gn_in = nn.GroupNorm(num_groups, input_dim)
-        
+        # 使用 Conv2d 替代 Linear，kernel_size=1 相当于对每个像素做 MLP
         self.adapter = nn.Sequential(
-            # 第一层：初步提取
-            nn.Linear(input_dim, mid_dim),
+            # 第一层：降维 + 归一化
+            nn.Conv2d(input_dim, mid_dim, kernel_size=1, bias=False),
             nn.GroupNorm(num_groups, mid_dim),
             nn.GELU(),
             
-            # 第二层：核心瓶颈压缩
-            nn.Linear(mid_dim, hidden_dim),
-            nn.GroupNorm(num_groups // 4 if num_groups > 8 else 8, hidden_dim), # 瓶颈层维度小，减少组数
+            # 第二层：核心瓶颈
+            nn.Conv2d(mid_dim, mid_dim // 4, kernel_size=1, bias=False),
             nn.GELU(),
-            nn.Dropout(hparams.get('mlp_dropout', 0.1)),
+            nn.Dropout2d(hparams.get('mlp_dropout', 0.1)), # 使用 Dropout2d 适配特征图
             
-            # 第三层：映射回原始空间
-            nn.Linear(hidden_dim, input_dim)
+            # 第三层：升维回原始通道数
+            nn.Conv2d(mid_dim // 4, input_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups, input_dim)
         )
         
     def forward(self, x):
-        # x shape: (B, C) 或 (B, N, C)
-        orig_shape = x.shape
-        
-        # 1. 统一转为 (Total_Tokens, C) 处理
-        if x.dim() == 3:
-            B, N, C = x.shape
-            x = x.reshape(-1, C)
-        
-        # 2. GN 归一化 (GN 在 1D 输入上也能工作)
-        x = self.gn_in(x)
-        
-        # 3. 核心 Bottleneck
-        x = self.adapter(x)
-        
-        # 4. 恢复原始形状
-        if len(orig_shape) == 3:
-            x = x.reshape(orig_shape[0], orig_shape[1], -1)
-            
-        return x
+        # x shape: (B, C, H, W)
+        return self.adapter(x)
 
 class ViT(nn.Module):
     def __init__(self, input_shape, hparams):
@@ -528,17 +504,16 @@ class ResNet50Decoder(nn.Module):
         # input_shape: (3, 224, 224)
         self.input_shape = input_shape
         
-        # 1D 特征转 2D 之前的对齐
-        self.prep = nn.Linear(feature_dim, 2048) if feature_dim != 2048 else nn.Identity()
+        # 核心改动：使用 1x1 卷积将拼接后的通道数 (如 4096) 降维到 2048
+        # 这样无论 feature_dim 是 2048 还是 4096，都能对齐到后续层
+        self.prep_conv = nn.Conv2d(feature_dim, 2048, kernel_size=1)
 
-        # 逆向路径：Stage 4 -> 3 -> 2 -> 1
-        # 7x7 -> 14x14 -> 28x28 -> 56x56 -> 112x112
+        # 逆向路径保持不变
         self.layer4 = ReverseBottleneck(2048, 1024, stride=2) 
         self.layer3 = ReverseBottleneck(1024, 512, stride=2)  
         self.layer2 = ReverseBottleneck(512, 256, stride=2)   
         self.layer1 = ReverseBottleneck(256, 64, stride=2)    
         
-        # 最后一次上采样：112x112 -> 224x224
         self.final = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(64, input_shape[0], kernel_size=3, padding=1),
@@ -546,19 +521,10 @@ class ResNet50Decoder(nn.Module):
         )
 
     def forward(self, x):
-        # x 形状可能是 (B, 49, 2048) 或 (B, 2048)
-        if x.dim() == 2:
-            B, C = x.shape
-            H = W = 1 # 如果是全池化特征，需要先还原到空间维度，这里假设是 7x7
-            x = x.unsqueeze(1).expand(-1, 49, -1) # 强行扩展以适配卷积逻辑
-            
-        B, N, C = x.shape
-        H = W = int(math.sqrt(N)) # N=49 时 H=7
-        
-        x = self.prep(x)
-        # (B, 49, 2048) -> (B, 2048, 7, 7)
-        x = x.transpose(1, 2).reshape(B, 2048, H, W)
-        
+        if x.dim() != 4:
+            raise ValueError(f"ResNet50Decoder预期输入维度为4(B,C,H,W), 但收到的是{x.dim()}")
+
+        x = self.prep_conv(x)
         x = self.layer4(x)
         x = self.layer3(x)
         x = self.layer2(x)

@@ -1,7 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import math
-from turtle import forward
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +10,43 @@ from domainbed.lib import wide_resnet
 import copy
 
 import timm
+
+
+def _build_torchvision_model(model_name, weights_name):
+    """Build torchvision model with the modern weights API and a safe fallback."""
+    builder = getattr(torchvision.models, model_name)
+    weights_enum = getattr(torchvision.models, weights_name, None)
+    if weights_enum is not None:
+        return builder(weights=weights_enum.DEFAULT)
+    return builder(pretrained=True)
+
+
+def _resolve_backbone_name(hparams):
+    """
+    Resolve backbone from `hparams["backbone"]`.
+    Accepted names are case-insensitive:
+    ResNet, ViT, AlexNet, EfficientNet, DINOv2.
+    If `backbone` is missing, default to ResNet.
+    """
+    backbone = hparams.get("backbone", None)
+    if backbone is None:
+        return "resnet"
+    if not isinstance(backbone, str) or not backbone.strip():
+        raise ValueError("Invalid `backbone`: expected a non-empty string.")
+
+    normalized = backbone.strip().lower()
+    mapping = {
+        "resnet": "resnet",
+        "vit": "vit",
+        "alexnet": "alexnet",
+        "efficientnet": "efficientnet",
+        "dinov2": "dinov2"
+    }
+    if normalized not in mapping:
+        raise ValueError(
+            f"Invalid backbone '{backbone}': choose from ResNet, ViT, AlexNet, EfficientNet, DINOv2"
+        )
+    return mapping[normalized]
 
 
 def remove_batch_norm_from_resnet(model):
@@ -112,10 +148,10 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams['resnet18']:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            self.network = _build_torchvision_model("resnet18", "ResNet18_Weights")
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            self.network = _build_torchvision_model("resnet50", "ResNet50_Weights")
             self.n_outputs = 2048
 
         if hparams['resnet50_augmix']:
@@ -246,15 +282,15 @@ def Featurizer(input_shape, hparams):
     elif input_shape[1:3] == (32, 32):
         return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.)
     elif input_shape[1:3] == (224, 224):
-        if hparams["vit"]:
-            if hparams["dinov2"]:
-                return DinoV2(input_shape, hparams)
-            elif hparams["alexnet"]:
-                return AlexNet(input_shape, hparams)
-            elif hparams["Efficientnet"]:
-                return EfficientNet(input_shape, hparams)
-            else:
-                raise NotImplementedError
+        backbone = _resolve_backbone_name(hparams)
+        if backbone == "dinov2":
+            return DinoV2(input_shape, hparams)
+        if backbone == "vit":
+            return ViT(input_shape, hparams)
+        if backbone == "alexnet":
+            return AlexNet(input_shape, hparams)
+        if backbone == "efficientnet":
+            return EfficientNet(input_shape, hparams)
         return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
@@ -263,14 +299,17 @@ def Featurizer(input_shape, hparams):
 def Decoder(feature_dim, input_shape, hparams):
     """Auto-select an appropriate decoder for the given input shape."""
     if len(input_shape) == 3:
-        if hparams['vit']:
-            return ViTDecoder()
-        elif hparams['alexnet']:
+        backbone = _resolve_backbone_name(hparams)
+        if backbone == "vit":
+            return ViTDecoder(feature_dim, input_shape, hparams)
+        elif backbone == "alexnet":
             return AlexNetDecoder(feature_dim, input_shape, hparams)
-        elif hparams['efficientnet']:
+        elif backbone == "efficientnet":
             return EfficientNetDecoder(feature_dim, input_shape, hparams)
+        elif backbone == "dinov2":
+            raise ValueError("Decoder for DINOv2 is not implemented.")
         else:
-            return ResNet50Decoder(feature_dim, input_shape, hparams) 
+            return ResNet50Decoder(feature_dim, input_shape, hparams)
 
 
 
@@ -309,192 +348,235 @@ class WholeFish(nn.Module):
 class PrivateHead(nn.Module):
     def __init__(self, input_dim, hparams):
         super(PrivateHead, self).__init__()
-        # input_dim 对于 ResNet50 是 2048
-        
-        num_groups = 32
-        mid_dim = input_dim // 4  # 适当收缩维度，减少显存占用
-        
-        # 使用 Conv2d 替代 Linear，kernel_size=1 相当于对每个像素做 MLP
-        self.adapter = nn.Sequential(
-            # 第一层：降维 + 归一化
+        dropout = hparams.get('mlp_dropout', 0.1)
+        mid_dim = max(input_dim // 4, 16)
+        vec_dim = max(input_dim // 2, 64)
+
+        # Learnable residual scale keeps the adapter stable at initialization.
+        self.res_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Spatial adapter for CNN feature maps: (B, C, H, W)
+        self.spatial_adapter = nn.Sequential(
             nn.Conv2d(input_dim, mid_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, mid_dim),
+            nn.BatchNorm2d(mid_dim),
             nn.GELU(),
-            
-            # 第二层：核心瓶颈
-            nn.Conv2d(mid_dim, mid_dim // 4, kernel_size=1, bias=False),
+            nn.Conv2d(mid_dim, mid_dim, kernel_size=1, bias=False),
             nn.GELU(),
-            nn.Dropout2d(hparams.get('mlp_dropout', 0.1)), # 使用 Dropout2d 适配特征图
-            
-            # 第三层：升维回原始通道数
-            nn.Conv2d(mid_dim // 4, input_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, input_dim)
+            nn.Dropout2d(dropout),
+            nn.Conv2d(mid_dim, input_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(input_dim)
         )
-        
+
+        # Token adapter for sequence features: (B, N, C)
+        self.token_adapter = nn.Sequential(
+            nn.Linear(input_dim, vec_dim, bias=False),
+            nn.LayerNorm(vec_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(vec_dim, input_dim, bias=False),
+            nn.LayerNorm(input_dim)
+        )
+
+        # Vector adapter for pooled features: (B, C)
+        self.vector_adapter = nn.Sequential(
+            nn.Linear(input_dim, vec_dim, bias=False),
+            nn.LayerNorm(vec_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(vec_dim, input_dim, bias=False),
+            nn.LayerNorm(input_dim)
+        )
+
+        # Lightweight CLS <-> patch interaction for ViT-like tokens.
+        self.patch_to_cls = nn.Linear(input_dim, input_dim, bias=False)
+        self.cls_to_patch = nn.Linear(input_dim, input_dim, bias=False)
+
     def forward(self, x):
-        # x shape: (B, C, H, W)
-        return self.adapter(x)
+        # CNN feature map
+        if x.dim() == 4:
+            delta = self.spatial_adapter(x)
+            return x + self.res_scale * delta
+
+        # Token feature
+        if x.dim() == 3:
+            delta = self.token_adapter(x)
+
+            n = x.size(1)
+            side = int(math.sqrt(max(n - 1, 1)))
+            has_cls = n > 1 and side * side == (n - 1)
+            if has_cls:
+                cls = delta[:, :1, :]
+                patches = delta[:, 1:, :]
+                patch_mean = patches.mean(dim=1, keepdim=True)
+                cls = cls + self.patch_to_cls(patch_mean)
+                patches = patches + self.cls_to_patch(cls).expand_as(patches)
+                delta = torch.cat([cls, patches], dim=1)
+
+            return x + self.res_scale * delta
+
+        # Vector feature
+        if x.dim() == 2:
+            delta = self.vector_adapter(x)
+            return x + self.res_scale * delta
+
+        raise ValueError(f"PrivateHead expects 2D, 3D or 4D input, got {x.dim()}D.")
 
 class ViT(nn.Module):
     def __init__(self, input_shape, hparams):
         super(ViT, self).__init__()
-        # 在 PyTorch 的神经网络模型中，input_shape 通常不包含 Batch Size。它指的是单张图像的维度
-        # Batch Size 只会在 forward(self, x) 函数被调用时，伴随输入张量 x 出现。在那时，x 的形状才是 (BatchSize, Channels, Height, Width)。
         nc = input_shape[0]
         if nc != 3:
             raise RuntimeError("ViT inputs must have 3 channels")
-        
-        # num_classes=0: 去掉最后的分类层，只保留特征提取部分
+
+        # Standard ViT-B/16 encoder with classifier head removed.
         self.network = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=0)
         self.n_outputs = 768
-        self.num_tokens = 197
-        
+
         self.hparams = hparams
         self.dropout = nn.Dropout(hparams.get('vit_dropout', 0.))
-        # 恒等映射，不改变输入，预留给需要激活函数的特定算法。
         self.activation = nn.Identity()
-        
-    def forward(self, x):
-        # 输出形状通常为 (BatchSize, 197, 768)
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, nc, input_shape[1], input_shape[2])
+            self.num_tokens = self._forward_tokens(dummy).shape[1]
+
+    def _forward_tokens(self, x):
         x = self.network.forward_features(x)
-        # 某些 timm 版本可能会返回 (features, global_pool_feat) 的元组。这里确保我们只拿到特征张量。
         if isinstance(x, tuple):
             x = x[0]
-        # 正常的 ViT 输出 (BatchSize, Sequence_Length, Embedding_Dim)
-        if x.dim() == 3:
-            return self.activation(self.dropout(x))
-        # 如果模型意外进行了全局平均池化变成了 (Batch, Embedding_Dim)。我们手动增加一个维度变成 (Batch, 1, Embedding_Dim) 以适配 Cross-Attention 层
-        elif x.dim() == 2:
-            return self.activation(self.dropout(x.unsqueeze(1)))
-        else:
-            return self.activation(self.dropout(x))
+        if isinstance(x, dict):
+            # timm may return dicts in some versions/configs.
+            if "x" in x:
+                x = x["x"]
+            elif "x_norm_patchtokens" in x:
+                patches = x["x_norm_patchtokens"]
+                cls = x.get("x_norm_clstoken", None)
+                x = torch.cat([cls.unsqueeze(1), patches], dim=1) if cls is not None else patches
+            else:
+                raise RuntimeError("Unsupported ViT feature dict format from timm.")
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        return x
 
+    def forward(self, x):
+        x = self._forward_tokens(x)
+        return self.activation(self.dropout(x))
 
 class EfficientNet(nn.Module):
     def __init__(self, input_shape, hparams):
         super(EfficientNet, self).__init__()
         nc = input_shape[0]
-        
-        self.network = torchvision.models.efficientnet_b0(pretrained=True)
-        # the output feature dimension of efficientnet_b0 is 1280
+
+        self.network = _build_torchvision_model("efficientnet_b0", "EfficientNet_B0_Weights")
         self.n_outputs = 1280
-        
-        # channel adaption logic
+
+        # Adapt first conv when input channels != 3.
         if nc != 3:
-            tmp = self.network.features[0][0].weight.data.clone()
-            self.network.features[0][0] = nn.Conv2d(
-                nc, 32, kernel_size=(3, 3),
-                stride=(2, 2), padding=(1, 1), bias=False)
+            old_conv = self.network.features[0][0]
+            tmp = old_conv.weight.data.clone()
+            new_conv = nn.Conv2d(
+                nc,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=False
+            )
             for i in range(nc):
-                self.network.features[0][0].weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-        
-        del self.network.classifier
+                new_conv.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+            self.network.features[0][0] = new_conv
+
+        # Remove classifier head and keep encoder features only.
         self.network.classifier = Identity()
-        
+
         self.hparams = hparams
         self.dropout = nn.Dropout(hparams.get('resnet_dropout', 0.))
         self.activation = nn.Identity()
-        
-        self.feature_proj = nn.Conv2d(1280, 1280, kernel_size=1)
-        
-        # compute number of tokens to match CrossAttention input requirements
+
         with torch.no_grad():
             dummy_input = torch.zeros(1, nc, input_shape[1], input_shape[2])
             dummy_output = self.network.features(dummy_input)
             _, _, self.spatial_h, self.spatial_w = dummy_output.shape
             self.num_tokens = self.spatial_h * self.spatial_w
-        self.register_buffer('num_tokens', torch.tensor(self.num_tokens))
-        
+
     def forward(self, x):
         x = self.network.features(x)
-        B, C, H, W = x.shape
-        
-        x = self.feature_proj(x)
-        x = x.view(B, C, H, W)
-        # (B, 1280, H, W) -> (B, 1280, H*W)
-        x = x.view(B, C, -1)
-        # (B, 1280, 49) -> (B, 49, 1280)
-        # transform (B, C, N) to (B, N, C)
-        x = x.transpose(1, 2)
-        x = self.activation(self.dropout(x))
-        return x
-
+        b, c, _, _ = x.shape
+        x = x.reshape(b, c, -1).transpose(1, 2)
+        return self.activation(self.dropout(x))
 
 class AlexNet(nn.Module):
     def __init__(self, input_shape, hparams):
         super(AlexNet, self).__init__()
         nc = input_shape[0]
-        # 兼容性处理：如果网络环境受限，建议在外部处理好权重
-        self.network = torchvision.models.alexnet(pretrained=True)
-        self.n_outputs = 4096
-        
-        # 处理非3通道输入
+
+        self.network = _build_torchvision_model("alexnet", "AlexNet_Weights")
+        self.n_outputs = 256
+
+        # Adapt first conv when input channels != 3.
         if nc != 3:
             old_conv = self.network.features[0]
-            self.network.features[0] = nn.Conv2d(nc, 64, kernel_size=11, stride=4, padding=2)
-            with torch.no_grad():
-                self.network.features[0].weight.data[:, :3] = old_conv.weight.data
-        
-        # 移除分类器，仅保留特征提取
-        del self.network.classifier
-        self.network.fc = Identity()
+            tmp = old_conv.weight.data.clone()
+            new_conv = nn.Conv2d(
+                nc,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=False
+            )
+            for i in range(nc):
+                new_conv.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+            self.network.features[0] = new_conv
 
-        # 动态计算空间尺寸
+        # Remove classifier and keep spatial encoder output.
+        self.network.classifier = Identity()
+
+        self.dropout = nn.Dropout(hparams.get('resnet_dropout', 0.))
+        self.activation = nn.Identity()
+
         with torch.no_grad():
             dummy = torch.zeros(1, nc, input_shape[1], input_shape[2])
-            dummy_feat = self.network.features(dummy)
-            self.spatial_h, self.spatial_w = dummy_feat.shape[2:] # 224下通常是 6x6
-            
-        self.feature_proj = nn.Conv2d(256, 4096, kernel_size=1)
-        self.dropout = nn.Dropout(hparams.get('resnet_dropout', 0.))
+            feat = self.network.avgpool(self.network.features(dummy))
+            self.spatial_h, self.spatial_w = feat.shape[2:]
+            self.num_tokens = self.spatial_h * self.spatial_w
 
     def forward(self, x):
-        x = self.network.features(x) # [B, 256, H, W]
-        x = self.feature_proj(x)     # [B, 4096, H, W]
-        B, C, H, W = x.shape
-        x = x.view(B, C, -1).transpose(1, 2) # [B, N, 4096]
-        return self.dropout(x)
+        x = self.network.features(x)
+        x = self.network.avgpool(x)
+        b, c, _, _ = x.shape
+        x = x.reshape(b, c, -1).transpose(1, 2)
+        return self.activation(self.dropout(x))
 
 class ReverseBottleneck(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super(ReverseBottleneck, self).__init__()
         mid_channels = out_channels // 4
         
-        # 动态获取 GN 组数逻辑
-        def get_gn(channels):
-            groups = 32
-            if channels < groups:
-                groups = 8 if channels >= 8 else channels
-            return nn.GroupNorm(groups, channels)
-
-        # 1. 1x1 压缩
         self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
-        self.gn1 = get_gn(mid_channels)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
         
-        # 2. 上采样逻辑
         self.upsample = nn.Upsample(scale_factor=stride, mode='bilinear', align_corners=False) if stride > 1 else nn.Identity()
         self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False)
-        self.gn2 = get_gn(mid_channels)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
         
-        # 3. 1x1 扩展
         self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=False)
-        self.gn3 = get_gn(out_channels)
+        self.bn3 = nn.BatchNorm2d(out_channels)
         
-        # Shortcut 连接
         self.shortcut = nn.Sequential()
         if stride > 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Upsample(scale_factor=stride, mode='bilinear', align_corners=False),
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                get_gn(out_channels)
+                nn.BatchNorm2d(out_channels)
             )
 
     def forward(self, x):
         identity = self.shortcut(x)
-        out = F.relu(self.gn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.upsample(out)
-        out = F.relu(self.gn2(self.conv2(out)))
-        out = self.gn3(self.conv3(out))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         out += identity
         return F.relu(out)
 
@@ -504,11 +586,11 @@ class ResNet50Decoder(nn.Module):
         # input_shape: (3, 224, 224)
         self.input_shape = input_shape
         
-        # 核心改动：使用 1x1 卷积将拼接后的通道数 (如 4096) 降维到 2048
-        # 这样无论 feature_dim 是 2048 还是 4096，都能对齐到后续层
+        # 鏍稿績鏀瑰姩锛氫娇鐢?1x1 鍗风Н灏嗘嫾鎺ュ悗鐨勯€氶亾鏁?(濡?4096) 闄嶇淮鍒?2048
+        # 杩欐牱鏃犺 feature_dim 鏄?2048 杩樻槸 4096锛岄兘鑳藉榻愬埌鍚庣画灞?
         self.prep_conv = nn.Conv2d(feature_dim, 2048, kernel_size=1)
 
-        # 逆向路径保持不变
+        # 閫嗗悜璺緞淇濇寔涓嶅彉
         self.layer4 = ReverseBottleneck(2048, 1024, stride=2) 
         self.layer3 = ReverseBottleneck(1024, 512, stride=2)  
         self.layer2 = ReverseBottleneck(512, 256, stride=2)   
@@ -521,8 +603,14 @@ class ResNet50Decoder(nn.Module):
         )
 
     def forward(self, x):
-        if x.dim() != 4:
-            raise ValueError(f"ResNet50Decoder预期输入维度为4(B,C,H,W), 但收到的是{x.dim()}")
+        if x.dim() == 2:
+            # ResNet without features_only may output pooled vectors (B, C).
+            x = x.unsqueeze(-1).unsqueeze(-1)
+        elif x.dim() == 3:
+            # Token-like input fallback.
+            x = _tokens_to_feature_map(x)
+        elif x.dim() != 4:
+            raise ValueError(f"ResNet50Decoder expects 2D/3D/4D input, got {x.dim()}D")
 
         x = self.prep_conv(x)
         x = self.layer4(x)
@@ -530,68 +618,107 @@ class ResNet50Decoder(nn.Module):
         x = self.layer2(x)
         x = self.layer1(x)
         x = self.final(x)
+        if x.shape[2:] != self.input_shape[1:]:
+            x = F.interpolate(x, size=self.input_shape[1:], mode='bilinear', align_corners=False)
         return x
+
+
+def _tokens_to_feature_map(x, expected_h=None, expected_w=None):
+    """
+    Convert feature tokens (B, N, C) into feature map (B, C, H, W).
+    Also supports a legacy case where tokens were concatenated along N:
+    N = 2 * H * W -> fold into channels as (B, 2C, H, W).
+    """
+    if x.dim() == 4:
+        return x
+    if x.dim() != 3:
+        raise ValueError(f"Expected 3D/4D features, got {x.dim()}D.")
+
+    b, n, c = x.shape
+    if expected_h is not None and expected_w is not None:
+        expected_n = expected_h * expected_w
+        if n == expected_n:
+            return x.transpose(1, 2).reshape(b, c, expected_h, expected_w)
+        if n == 2 * expected_n:
+            x = x.reshape(b, 2, expected_n, c).permute(0, 2, 1, 3).reshape(b, expected_n, 2 * c)
+            return x.transpose(1, 2).reshape(b, 2 * c, expected_h, expected_w)
+
+    side = int(math.sqrt(n))
+    if side * side == n:
+        return x.transpose(1, 2).reshape(b, c, side, side)
+
+    # Fallback for legacy fused tokens: N = 2 * (H * W)
+    if n % 2 == 0:
+        half = n // 2
+        side = int(math.sqrt(half))
+        if side * side == half:
+            x = x.reshape(b, 2, half, c).permute(0, 2, 1, 3).reshape(b, half, 2 * c)
+            return x.transpose(1, 2).reshape(b, 2 * c, side, side)
+
+    raise ValueError(f"Cannot infer spatial size from token count N={n}.")
 
 
 class EfficientNetDecoder(nn.Module):
     def __init__(self, feature_dim, input_shape, hparams, stride=32):
         super(EfficientNetDecoder, self).__init__()
-        self.input_shape = input_shape # (3, 244, 244)
-        self.spatial_h = input_shape[1] // stride # feature graph height, default 7
-        self.spatial_w = input_shape[2] // stride # feature graph width, default 7
-
+        self.input_shape = input_shape
+        self.spatial_h = input_shape[1] // stride
+        self.spatial_w = input_shape[2] // stride
         self.channel_adjust = nn.Conv2d(feature_dim, 1280, kernel_size=1) if feature_dim != 1280 else nn.Identity()
-        
-        
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(1280, 512, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, input_shape[0], kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()
-        )
-        
+
+        self.up1 = nn.ConvTranspose2d(1280, 512, kernel_size=4, stride=2, padding=1)
+        self.bn1 = nn.BatchNorm2d(512)
+        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(256)
+        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(64)
+        self.up5 = nn.ConvTranspose2d(64, input_shape[0], kernel_size=4, stride=2, padding=1)
+
+        # Skip connections from bottleneck to each decoder stage.
+        self.skip1 = nn.Conv2d(1280, 512, kernel_size=1, bias=False)
+        self.skip2 = nn.Conv2d(1280, 256, kernel_size=1, bias=False)
+        self.skip3 = nn.Conv2d(1280, 128, kernel_size=1, bias=False)
+        self.skip4 = nn.Conv2d(1280, 64, kernel_size=1, bias=False)
+
+    def _fuse_skip(self, x, bottleneck, proj):
+        skip = F.interpolate(bottleneck, size=x.shape[2:], mode='bilinear', align_corners=False)
+        skip = proj(skip)
+        return F.relu(x + skip, inplace=True)
+
     def forward(self, x):
-        B, N, C = x.shape
-        # reshape (B, 49, 1280) to (B, 1280, 7, 7)
-        x = x.transpose(1, 2).reshape(B, C, self.spatial_h, self.spatial_w)
-        x = self.channel_adjust(x)
-        x = self.decoder(x)
+        x = _tokens_to_feature_map(x, self.spatial_h, self.spatial_w)
+        x = self.channel_adjust(x)  # (B, 1280, 7, 7)
+        bottleneck = x
+
+        x = self.bn1(self.up1(x))
+        x = self._fuse_skip(x, bottleneck, self.skip1)
+        x = self.bn2(self.up2(x))
+        x = self._fuse_skip(x, bottleneck, self.skip2)
+        x = self.bn3(self.up3(x))
+        x = self._fuse_skip(x, bottleneck, self.skip3)
+        x = self.bn4(self.up4(x))
+        x = self._fuse_skip(x, bottleneck, self.skip4)
+        x = torch.sigmoid(self.up5(x))
+
         if x.shape[2:] != self.input_shape[1:]:
             x = F.interpolate(x, size=self.input_shape[1:], mode='bilinear', align_corners=False)
         return x
 
 
 class AlexNetDecoder(nn.Module):
-    def __init__(self, feature_dim, input_shape, hparams, stride=32):
+    def __init__(self, feature_dim, input_shape, hparams):
         super(AlexNetDecoder, self).__init__()
         self.input_shape = input_shape
-        self.spatial_h = input_shape[1] // stride
-        self.spatial_w = input_shape[2] // stride
+        self.channel_adjust = nn.Conv2d(feature_dim, 256, kernel_size=1) if feature_dim != 256 else nn.Identity()
 
-        # 第一步：通道压缩 4096 -> 256
-        self.prep = nn.Sequential(
-            nn.Conv2d(feature_dim, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True)
-        )
-
-        # 采用 Upsample + Conv 替代 ConvTranspose2d 消除棋盘格
         self.upsample_blocks = nn.ModuleList([
-            self._make_up_block(256, 128), # 6x6 -> 12x12
-            self._make_up_block(128, 64),  # 12x12 -> 24x24
-            self._make_up_block(64, 32),   # 24x24 -> 48x48
-            self._make_up_block(32, 16),   # 48x48 -> 96x96
-            self._make_up_block(16, 16),   # 96x96 -> 192x192
+            self._make_up_block(256, 128),
+            self._make_up_block(128, 64),
+            self._make_up_block(64, 32),
+            self._make_up_block(32, 16),
+            self._make_up_block(16, 16),
         ])
 
         self.final_conv = nn.Sequential(
@@ -608,21 +735,16 @@ class AlexNetDecoder(nn.Module):
         )
 
     def forward(self, x):
-        B, N, C = x.shape
-        # [B, 36, 4096] -> [B, 4096, 6, 6]
-        x = x.transpose(1, 2).reshape(B, C, self.spatial_h, self.spatial_w)
-        x = self.prep(x)
-        
+        x = _tokens_to_feature_map(x)
+        x = self.channel_adjust(x)
+
         for block in self.upsample_blocks:
             x = block(x)
-            
+
         x = self.final_conv(x)
-        
-        # 解决 AlexNet 步幅不精准的问题 (192 -> 224)
         if x.shape[2:] != self.input_shape[1:]:
             x = F.interpolate(x, size=self.input_shape[1:], mode='bilinear', align_corners=False)
         return x
-
 
 class ViTDecoder(nn.Module):
     def __init__(self, feature_dim, input_shape, hparams):
@@ -648,7 +770,8 @@ class ViTDecoder(nn.Module):
             nhead=8,
             dim_feedforward=feature_dim * 4,
             dropout=0.1,
-            activation='gelu'
+            activation='gelu',
+            batch_first=True
         )
         # stack 6 decoder_layer
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)

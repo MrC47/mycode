@@ -2639,67 +2639,6 @@ class ADRMX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
-class CrossAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=8):
-        super(CrossAttention, self).__init__()
-        # 输入特征的总维度（例如 Vit 是 768）
-        self.embed_dim = embed_dim
-        # 多头注意力的“头”数
-        self.num_heads = num_heads
-        # 每个头分配到的维度（768/8 = 96）
-        self.head_dim = embed_dim // num_heads
-       
-        # 确保总维度能被头数整除，否则特征对齐会出错
-        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-       
-        # 定义四个线性变换矩阵（投影层）
-        self.q_proj = nn.Linear(embed_dim, embed_dim) # 把 Query 投影到新空间
-        self.k_proj = nn.Linear(embed_dim, embed_dim) # 把 Key 投影到新空间
-        self.v_proj = nn.Linear(embed_dim, embed_dim) # 把 Value 投影到新空间
-        self.out_proj = nn.Linear(embed_dim, embed_dim) # 最后输出前的融合层
-       
-    def forward(self, q, k, v):
-        # get batchsize
-        B = q.size(0)
-       
-        # for robustness :when q, k, and v are 2-dimension tensorsl(B, C),expand them to 3-dimension (B, 1, C)
-        if q.dim() == 2:
-            q = q.unsqueeze(1)
-        if k.dim() == 2:
-            k = k.unsqueeze(1)
-        if v.dim() == 2:
-            v = v.unsqueeze(1)
-       # perform linear projection
-        q = self.q_proj(q)
-        k = self.k_proj(k)
-        v = self.v_proj(v)
-       
-        # get the sequence lengths of q, k and v
-        num_q_tokens = q.size(1)
-        num_k_tokens = k.size(1)
-        num_v_tokens = v.size(1)
-         
-        # 1. view: (B, N, C) -> (B, N, heads, head_dim) split heads for multi-head attention
-        # 2. transpose(1, 2): -> (B, heads, N, head_dim)
-        # shape (B, N, C) is equivalent to (B, S, E) in other notation
-        # transpose for multi-head attention: (B, N, heads, head_dim) -> (B, heads, N, head_dim)
-        # this enables batched matrix multiplication across heads
-        q = q.view(B, num_q_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, num_k_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, num_v_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-       
-        # compute attention score
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        attn_weights = F.softmax(attn_weights, dim=-1)
-       
-        attn_output = torch.matmul(attn_weights, v)
-        # restore original dimension order
-        attn_output = attn_output.transpose(1, 2).contiguous()
-       
-        attn_output = attn_output.view(B, num_q_tokens, self.embed_dim)
-        output = self.out_proj(attn_output)
-        # Returns tensor with sequence shape (B, N, C)
-        return output
 class MyModel(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(MyModel, self).__init__(input_shape, num_classes, num_domains, hparams)
@@ -2708,6 +2647,7 @@ class MyModel(Algorithm):
 
         self.num_domains = num_domains
         self.input_shape = input_shape # (3, 224, 224)
+        self.backbone_type = self._resolve_backbone_type()
 
         self.causal_extractor = networks.Featurizer(input_shape, self.hparams)
         self.feature_dim = self.causal_extractor.n_outputs
@@ -2748,6 +2688,12 @@ class MyModel(Algorithm):
             weight_decay=self.hparams['weight_decay']
         )
 
+    def _resolve_backbone_type(self):
+        return networks._resolve_backbone_name(self.hparams)
+
+    def _is_transformer_backbone(self):
+        return self.backbone_type in ["vit", "dinov2"]
+
     def _pool_features(self, features):
         # Compatible ResNet/CNN: [B, C, H, W] -> [B, C]
         if features.dim() == 4:
@@ -2755,11 +2701,29 @@ class MyModel(Algorithm):
        
         # Compatible ViT: [B, 197, 768] -> [B, 768]
         if features.dim() == 3:
-            if self.hparams['vit']:
+            if self._is_transformer_backbone() and features.size(1) > 1:
                 return features[:, 0]
             return features.mean(dim=1)
-           
+            
         return features
+
+    def _build_latent_for_decoder(self, causal_features_raw, private_cat):
+        if causal_features_raw.dim() != private_cat.dim():
+            raise ValueError(
+                f"Feature rank mismatch: causal={causal_features_raw.dim()}D, private={private_cat.dim()}D"
+            )
+
+        if causal_features_raw.dim() == 4:
+            return torch.cat([causal_features_raw, private_cat], dim=1)
+        if causal_features_raw.dim() == 3:
+            # One-to-one backbone pairing:
+            # ViT/DINOv2: concat on channel dim; CNN-token backbones: concat on token dim.
+            concat_dim = 2 if self._is_transformer_backbone() else 1
+            return torch.cat([causal_features_raw, private_cat], dim=concat_dim)
+        if causal_features_raw.dim() == 2:
+            return torch.cat([causal_features_raw, private_cat], dim=1)
+
+        raise ValueError(f"Unsupported feature rank for decoder input: {causal_features_raw.dim()}D")
     
     def _get_feature_for_attention(self, features):
         if features.dim() == 3:
@@ -2895,16 +2859,9 @@ class MyModel(Algorithm):
         else:
             private_cat = causal_features_raw
 
-        f_p = self._pool_features(private_cat)
-        gate_weights = self.gate(f_p)
-
         f_c = self._pool_features(causal_features_raw)
-        f_fused_vec = f_c + gate_weights * f_p
-        if self.hparams['vit']:
-            latent_for_reco = torch.cat([causal_features_raw, private_cat], dim=2)
-        else:
-            latent_for_reco = torch.cat([causal_features_raw, private_cat], dim=1)
-        logits = self.classifier(f_fused_vec)
+        latent_for_reco = self._build_latent_for_decoder(causal_features_raw, private_cat)
+        logits = self.classifier(f_c)
         reconstructed = self.decoder(latent_for_reco)
         mean = torch.tensor([0.485, 0.456, 0.406]).to(device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).to(device).view(1, 3, 1, 1)
@@ -2984,8 +2941,6 @@ class MyModel(Algorithm):
            
             # 6. 赋值与截断
             new_weights = torch.clamp(new_weights, 0.02, 10.0)  # 放宽上限
-            new_weights[4] = torch.clamp(new_weights[4], max=1.5) # 限制能量损失权重
-            new_weights[2] = torch.clamp(new_weights[2], min=0.5) # 保护正交损失权重
             self.task_weights.data.copy_(new_weights)
 
         # 最终总损失计算
@@ -3018,19 +2973,8 @@ class MyModel(Algorithm):
    
     def predict(self, x):
         self.eval()
-        # Since private feature encoder cannot bu used during testing, use causal features as replacement
         with torch.no_grad():
-            # 1. 提取因果特征
             f_c_raw = self.causal_extractor(x)
             f_c_vec = self._pool_features(f_c_raw)
             
-            # 2. 使用原型 (Prototype) 模拟平均私有特征
-            # 或者简单地：在测试集不使用私有修正，只靠因果预测
-            # 这里推荐使用原型，以保持输入分布的一致性
-            f_p_mock = self.prototypes.mean(dim=0).unsqueeze(0).expand(x.size(0), -1)
-            
-            # 3. 门控自适应过滤
-            gate_weights = self.gate(f_p_mock)
-            f_fused_vec = f_c_vec + gate_weights * f_p_mock
-            
-            return self.classifier(f_fused_vec)
+            return self.classifier(f_c_vec)

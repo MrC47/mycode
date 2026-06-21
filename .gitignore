@@ -7,3 +7,4 @@ train_output/*
 .venv/
 datasets_cache/
 mydatasets/
+output/

@@ -8,3 +8,6 @@ train_output/*
 datasets_cache/
 mydatasets/
 output/
+wavelet_output/
+ycbcr_output/
+fft_output/

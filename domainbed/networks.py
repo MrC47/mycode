@@ -1505,10 +1505,16 @@ class FourierStyleExpert(nn.Module):
         g = g.detach()
 
         # ── 各频带扰动，按 router 权重软组合（可微到 router）──
-        # delta[b,c,h,w] = eps * Σ_k w[b,k] * mask[k,h,w] * g[b,c,h,w]
-        delta = self.eps * torch.einsum(
-            "bk,khw,bchw->bchw", router_weights, self.band_masks, g
-        )
+        # 相对扰动: delta = eps * |amp| * Σ_k w_k * mask_k * sign(g)
+        #   ε=0.1 → 每个幅度分量扰动 10%，与幅度绝对尺度无关。
+        #   旧版用绝对 ε=0.1，相对幅度谱(O(10~100))是千分之几，分类器
+        #   无视扰动→loss_cls 归零→过拟合→env0 冲高后回落。相对扰动让
+        #   挑战强度在所有频率上一致，分类器无法靠"放大特征"绕过。
+        rel_scale = self.eps * amp.detach()                    # [B, C, H, W]
+        band_gate = torch.einsum(
+            "bk,khw->bhw", router_weights, self.band_masks
+        ).unsqueeze(1)                                         # [B, 1, H, W]
+        delta = rel_scale * band_gate * g                      # [B, C, H, W]
 
         # ── 只扰动幅度谱（风格），相位谱（内容）保持原样 ──
         amp_pert = amp + delta                              # amp 带 backbone 梯度, delta 带 router 梯度

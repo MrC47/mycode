@@ -1,8 +1,0 @@
-.venv
-venv/
-mydatasets/
-datatasets_cache/
-prompt.txt
-requirements.txt
-*.pth
-output/

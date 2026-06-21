@@ -10,19 +10,19 @@ import torch.nn.functional as F
 import torchvision.models
 
 # --- Mamba2 依赖 ---
-from einops import rearrange, repeat
-from mamba_ssm.modules.mamba2 import RMSNormGated
-from mamba_ssm.ops.triton.ssd_combined import (
-    mamba_chunk_scan_combined,
-    mamba_split_conv1d_scan_combined,
-)
+# from einops import rearrange, repeat
+# from mamba_ssm.modules.mamba2 import RMSNormGated
+# from mamba_ssm.ops.triton.ssd_combined import (
+#     mamba_chunk_scan_combined,
+#     mamba_split_conv1d_scan_combined,
+# )
 
-from domainbed.lib import wide_resnet
+# from domainbed.lib import wide_resnet
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
+# try:
+#     from causal_conv1d import causal_conv1d_fn
+# except ImportError:
+#     causal_conv1d_fn = None
 
 
 def remove_batch_norm_from_resnet(model):
@@ -1451,11 +1451,12 @@ class FourierStyleExpert(nn.Module):
     由 Module 1 谱分析/中介分析给出理论依据，而非人设。
     """
 
-    def __init__(self, feat_dim, n_bands=3, eps=0.1):
+    def __init__(self, feat_dim, n_bands=3, eps=0.1, pgd_steps=3):
         super().__init__()
         self.feat_dim = feat_dim
         self.n_bands = n_bands
         self.eps = eps
+        self.pgd_steps = pgd_steps
         # 频带 mask 延迟到首次 forward 时按实际 H,W 构建（适配任意输入尺寸）
         self.register_buffer("band_masks", torch.empty(0))
 
@@ -1495,26 +1496,40 @@ class FourierStyleExpert(nn.Module):
         amp = Fc.abs()                        # 幅度谱（风格）
         pha = Fc.angle()                      # 相位谱（内容）—— 不扰动
 
-        # ── FGSM 单步闭式求最难方向（detached, 不学习）──
-        amp_det = amp.detach().clone().requires_grad_(True)
-        recon = amp_det * torch.exp(1j * pha.detach())
-        feat_det = torch.fft.ifft2(recon).real
-        logits_det = classifier(feat_det.mean(dim=[2, 3]))
-        loss_det = F.cross_entropy(logits_det, labels)
-        g = torch.autograd.grad(loss_det, amp_det)[0].sign()   # [B, C, H, W]
-        g = g.detach()
-
-        # ── 各频带扰动，按 router 权重软组合（可微到 router）──
-        # 相对扰动: delta = eps * |amp| * Σ_k w_k * mask_k * sign(g)
-        #   ε=0.1 → 每个幅度分量扰动 10%，与幅度绝对尺度无关。
-        #   旧版用绝对 ε=0.1，相对幅度谱(O(10~100))是千分之几，分类器
-        #   无视扰动→loss_cls 归零→过拟合→env0 冲高后回落。相对扰动让
-        #   挑战强度在所有频率上一致，分类器无法靠"放大特征"绕过。
-        rel_scale = self.eps * amp.detach()                    # [B, C, H, W]
+        # ── 扰动尺度与频带门控（外层可微到 router）──
+        # 相对扰动球半径: 每个幅度分量允许扰动 ε·|amp|（ε=0.1→10%）。
+        # 相对而非绝对，保证挑战强度在所有频率上一致，分类器无法靠放大
+        # 特征绕过。band_gate = Σ_k w_k·mask_k ∈ [0,1]，router 软选频带。
+        amp_ref = amp.detach()
+        ball = self.eps * amp_ref                             # 扰动上界 [B, C, H, W]
         band_gate = torch.einsum(
             "bk,khw->bhw", router_weights, self.band_masks
-        ).unsqueeze(1)                                         # [B, 1, H, W]
-        delta = rel_scale * band_gate * g                      # [B, C, H, W]
+        ).unsqueeze(1)                                        # [B, 1, H, W]
+
+        # ── PGD 多步求最难扰动方向（detached, 不更新 classifier/bb）──
+        # 旧版 FGSM 单步：sign(∇CE) 只给一阶最陡方向，分类器几步就压平
+        # 该方向邻域 → loss_cls→0 → 扰动失效。PGD 迭代累积+重投影，探索
+        # 更大扰动邻域，找到分类器真正最难受的方向 → 持续构成挑战。
+        # 每步: δ ← δ + (ball/n_steps)·gate·sign(∇_amp CE)，再裁回相对球内。
+        pha_ref = pha.detach()
+        step_size = ball / max(self.pgd_steps, 1)
+        delta = torch.zeros_like(amp_ref)
+        for _ in range(self.pgd_steps):
+            amp_var = (amp_ref + delta).detach().requires_grad_(True)
+            recon = amp_var * torch.exp(1j * pha_ref)
+            feat_var = torch.fft.ifft2(recon).real
+            logits_var = classifier(feat_var.mean(dim=[2, 3]))
+            loss_var = F.cross_entropy(logits_var, labels)
+            g = torch.autograd.grad(loss_var, amp_var)[0].detach().sign()
+            # 只在被选频带内推进，门控项带 router 梯度
+            delta = delta + step_size * band_gate * g
+            # 投影回相对球: |delta| ≤ ball（ball=0 处安全置 0）
+            delta = torch.where(
+                ball > 1e-12,
+                ball * (delta / (ball + 1e-12)).clamp(-1.0, 1.0),
+                torch.zeros_like(delta),
+            )
+        delta = delta.detach()
 
         # ── 只扰动幅度谱（风格），相位谱（内容）保持原样 ──
         amp_pert = amp + delta                              # amp 带 backbone 梯度, delta 带 router 梯度

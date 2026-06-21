@@ -11,3 +11,5 @@ output/
 wavelet_output/
 ycbcr_output/
 fft_output/
+CLAUDE.md
+.claudeignore

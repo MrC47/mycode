@@ -282,6 +282,7 @@ class VLCS(MultipleEnvironmentImageFolder):
 
 class PACS(MultipleEnvironmentImageFolder):
     CHECKPOINT_FREQ = 300
+    N_WORKERS = 8
     ENVIRONMENTS = ["A", "C", "P", "S"]
     def __init__(self, root, test_envs, hparams):
         self.dir = os.path.join(root, "PACS/")

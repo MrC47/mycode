@@ -2913,6 +2913,8 @@ class MyModel(Algorithm):
         # （将来 K 由 Module 1 谱分析/中介分析给出理论依据，而非人设）
         self.n_bands = int(hparams.get("n_experts", num_domains))
         self.eps = float(hparams.get("fgsm_eps", 0.1))
+        # PGD 内层步数：1=单步FGSM(旧)，3=多步PGD(找分类器真正最难受方向)
+        self.pgd_steps = int(hparams.get("pgd_steps", 3))
 
         # 1. Backbone
         self.backbone = networks.ResNet50FeatureMap(
@@ -2927,9 +2929,10 @@ class MyModel(Algorithm):
             nn.Linear(128, self.n_bands),
         )
 
-        # 3. 频域因子专家（无可学习扰动参数，含固定径向频率带 + FGSM）
+        # 3. 频域因子专家（无可学习扰动参数，含固定径向频率带 + PGD）
         self.expert = networks.FourierStyleExpert(
-            feat_dim=self.feat_dim, n_bands=self.n_bands, eps=self.eps
+            feat_dim=self.feat_dim, n_bands=self.n_bands,
+            eps=self.eps, pgd_steps=self.pgd_steps
         )
 
         # 4. 主分类器

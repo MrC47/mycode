@@ -2888,18 +2888,20 @@ class ADRMX(Algorithm):
 class MyModel(Algorithm):
     """
     ============================================================================
-    模块 2：MoE 双优化器反制训练
+    模块 2：频域因子专家 + FGSM 对抗扰动（单优化器，无 min-max）
     ============================================================================
     核心思想：
-      - K 个 StyleQueryExpert，Q=style, K=V=tokens（反制基底）
-      - 双优化器交替更新：opt_cls 降 CE，opt_exp 升 CE
-      - Router argmax 硬分配，从 -CE 中学风格路由
-      - 负载均衡损失防止专家坍缩
+      - 傅里叶分解：相位谱 φ=内容（不动），幅度谱 |F|=风格（扰动加在此）
+      - K 个固定径向频率带 = K 个 style 因子专家
+      - FGSM 单步闭式求当前分类器最难扰动方向 g=sign(∇_|F| CE)
+      - Router 软选择各频带扰动权重 → 因子组合式干预
+      - 单优化器 min CE(扰动后特征)：无 min-max、无专家追不上/投降问题
 
-    梯度流向：
-      opt_cls (backbone + classifier):  min CE      正常梯度
-      opt_exp (router + experts):       max CE      取反梯度
-    ============================================================================
+    为何比旧版好：
+      - 频率轴跨域通用 → 训练域扰动可迁移到 OOD（Photo）← 解决第四环
+      - 相位谱频域硬隔离 → 内容不被破坏，无需 loss_perturb 约束
+      - FGSM 闭式求解 → 不存在"学出来的专家追不上分类器"
+      - 无可学习扰动参数 → 不会坍缩到 0
     """
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -2907,216 +2909,120 @@ class MyModel(Algorithm):
 
         self.num_domains = num_domains
         self.feat_dim = 512
+        # 专家数 = 频带数 K。默认取训练域数，可由 hparam 覆盖
+        # （将来 K 由 Module 1 谱分析/中介分析给出理论依据，而非人设）
+        self.n_bands = int(hparams.get("n_experts", num_domains))
+        self.eps = float(hparams.get("fgsm_eps", 0.1))
 
         # 1. Backbone
         self.backbone = networks.ResNet50FeatureMap(
             input_shape, feat_dim=self.feat_dim, freeze_early_layers=True
         )
 
-        # 2. Router: MLP(512→128→K) → argmax
+        # 2. Router: 输入全量特征 pooled（v1 简化，将来替换为 Module 1 的 Z）
+        #    第一层 MLP 可替换输入维度，方便将来接 Z，不焊死。
         self.router = nn.Sequential(
             nn.Linear(self.feat_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, num_domains),
+            nn.Linear(128, self.n_bands),
         )
 
-        # 3. K 个 StyleQueryExpert
-        self.experts = nn.ModuleList(
-            [
-                networks.StyleQueryExpert(
-                    feat_dim=self.feat_dim, n_tokens=16, n_heads=8
-                )
-                for _ in range(num_domains)
-            ]
+        # 3. 频域因子专家（无可学习扰动参数，含固定径向频率带 + FGSM）
+        self.expert = networks.FourierStyleExpert(
+            feat_dim=self.feat_dim, n_bands=self.n_bands, eps=self.eps
         )
 
         # 4. 主分类器
         self.classifier = nn.Linear(self.feat_dim, num_classes)
 
-        # 5. 双优化器 + 调度器
+        # 5. 单优化器 + 调度器
         self._setup_optimizers()
 
     def _setup_optimizers(self):
-        """双优化器 + Cosine LR 调度器。"""
+        """单优化器（backbone + classifier + router）+ Cosine LR。"""
         from itertools import chain
 
         lr = self.hparams["lr"]
         wd = self.hparams["weight_decay"]
 
-        # opt_cls: 学好特征 + 分类
-        opt_cls_params = list(chain(
+        params = list(chain(
             self.backbone.parameters(),
             self.classifier.parameters(),
+            self.router.parameters(),
         ))
-        self.opt_cls = torch.optim.Adam(opt_cls_params, lr=lr, weight_decay=wd)
-        self.sch_cls = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt_cls, T_max=5000, eta_min=1e-7
+        self.opt = torch.optim.Adam(params, lr=lr, weight_decay=wd)
+        self.sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt, T_max=5000, eta_min=1e-7
         )
-
-        # opt_exp: 反制 + 路由
-        # Hinge-margin 对抗有上界（梯度在 prob_correct≤margin 时精确为 0），
-        # 不会再无界放大，因此专家 LR 可从 0.05× 提到 0.2×，追得上分类器。
-        opt_exp_params = list(self.router.parameters())
-        for expert in self.experts:
-            opt_exp_params.extend(expert.parameters())
-        self.opt_exp = torch.optim.Adam(opt_exp_params, lr=lr * 0.2, weight_decay=wd)
-        self.sch_exp = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt_exp, T_max=5000, eta_min=1e-7
-        )
-
-    def _forward_with_expert(self, feat, expert_idx):
-        """
-        根据 Router 的分配，将每个样本送入对应的 StyleQueryExpert 做风格干预。
-
-        实现细节：
-          - 每个 batch 中各样本可能被分配到不同专家
-          - 按专家索引分组后，每组同时送入对应的专家（batch 推理）
-          - 未被分配的专家不参与前传（稀疏激活，节省计算）
-
-        Args:
-            feat:        [B, 512, 7, 7] backbone 输出的特征图
-            expert_idx:  [B]  Router 分配的专家索引（0 ~ K-1）
-
-        Returns:
-            transformed: [B, 512, 7, 7] 每个样本经对应专家干预后的特征
-        """
-        transformed = feat.clone()
-        for k in range(self.num_domains):
-            mask = expert_idx == k
-            if mask.any():
-                transformed[mask] = self.experts[k](feat[mask])
-        return transformed
-
-    def _forward(self, all_x, use_softmax=False):
-        """
-        MoE 前传。
-
-        use_softmax=True (训练):
-          softmax → 只跑 top-1 专家 → 输出乘 soft 权重 → 梯度可回传 router
-        use_softmax=False (推理/opt_cls):
-          argmax → 只跑对应专家 → 无权重 → 推理模式
-
-        Returns:
-            logits:      [B, num_classes]
-            expert_idx:  [B]
-        """
-        feat = self.backbone(all_x)            # [B, 512, 7, 7]
-        pooled = feat.mean(dim=[2, 3])         # [B, 512]
-        router_logits = self.router(pooled)    # [B, K]
-
-        if use_softmax:
-            soft_weights = F.softmax(router_logits, dim=1)  # [B, K]
-            expert_idx = soft_weights.argmax(dim=1)          # [B]
-        else:
-            soft_weights = None
-            expert_idx = router_logits.argmax(dim=1)         # [B]
-
-        transformed = self._forward_with_expert(feat, expert_idx)
-
-        if soft_weights is not None:
-            # 乘 softmax 权重 → 梯度通过权重流回 router
-            weight = soft_weights.gather(1, expert_idx.unsqueeze(1))  # [B, 1]
-            transformed = transformed * weight.view(-1, 1, 1, 1)
-
-        pooled_out = transformed.mean(dim=[2, 3])
-        return self.classifier(pooled_out), expert_idx
 
     def update(self, minibatches, unlabeled=None):
         """
-        双优化器交替训练 — 标准 MoE 软路由。
+        单优化器对抗训练（Madry 式：在对抗扰动特征上 min CE）。
 
-        opt_cls (backbone + classifier):  min CE    argmax 路由
-        opt_exp (router + experts):       max CE    softmax 权重路由（梯度回传）
-
-        Args:
-            minibatches: list of (x, y) tuples，每个域一个。
-        Returns:
-            dict: 损失值。
+        流程：
+          1. Backbone → feat
+          2. Router(全量特征) → softmax 软选择各频带权重 w_k
+          3. FFT: φ（内容，不动）+ |F|（风格）
+          4. FGSM 单步: g = sign(∇_|F| CE)（闭式, 用当前分类器, 不更新其参数）
+          5. δ = ε · Σ_k w_k · mask_k · g   （只加在幅度谱上）
+          6. IFFT(φ, |F|+δ) → 扰动特征
+          7. min CE(扰动特征) + 负载均衡
         """
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
-        K = self.num_domains
 
-        # ── 公共：Backbone ──
-        feat = self.backbone(all_x)             # [B, 512, 7, 7]
+        # ── 1. Backbone ──
+        feat = self.backbone(all_x)                 # [B, 512, 7, 7]
+        pooled = feat.mean(dim=[2, 3])              # [B, 512]
 
-        # ── Step 1: opt_cls — 学好特征 + 分类 ──
-        pooled = feat.mean(dim=[2, 3])          # [B, 512]
-        expert_idx = self.router(pooled).argmax(dim=1)  # [B]
-        transformed = self._forward_with_expert(feat, expert_idx)
-        pooled_out = transformed.mean(dim=[2, 3])
-        logits = self.classifier(pooled_out)
+        # ── 2. Router 软选择频带（可微，梯度回传 router）──
+        router_logits = self.router(pooled)         # [B, K]
+        soft_weights = F.softmax(router_logits, dim=1)  # [B, K]
+
+        # ── 3-6. 频域 FGSM 扰动（只动幅度谱/风格，相位/内容不动）──
+        feat_pert = self.expert(feat, soft_weights, self.classifier, all_y)
+
+        # ── 7. 在扰动特征上 min CE ──
+        pooled_pert = feat_pert.mean(dim=[2, 3])
+        logits = self.classifier(pooled_pert)
         loss_cls = F.cross_entropy(logits, all_y)
 
-        self.opt_cls.zero_grad()
-        loss_cls.backward()
+        # ── 负载均衡（防止 router 坍缩到单一频带）──
+        f_k = soft_weights.mean(dim=0) + 1e-8        # [K]
+        loss_balance = (f_k * f_k.log()).sum()       # 负熵，最小化→均匀
+
+        loss = loss_cls + 0.01 * loss_balance
+
+        self.opt.zero_grad()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.backbone.parameters()) + list(self.classifier.parameters()),
+            list(self.backbone.parameters())
+            + list(self.classifier.parameters())
+            + list(self.router.parameters()),
             max_norm=1.0,
         )
-        self.opt_cls.step()
+        self.opt.step()
+        self.sch.step()
 
-        # ── Step 2: opt_exp — 反制 + 学风格路由 ──
-        # feat_detach 确保 backbone 不收 -CE 梯度
-        feat_detach = feat.detach()
-        pooled_d = feat_detach.mean(dim=[2, 3])
-        router_logits = self.router(pooled_d)               # [B, K]
-        soft_weights = F.softmax(router_logits, dim=1)      # [B, K]
-        expert_idx2 = soft_weights.argmax(dim=1)            # [B]
-
-        transformed2 = self._forward_with_expert(feat_detach, expert_idx2)
-        weight = soft_weights.gather(1, expert_idx2.unsqueeze(1))  # [B, 1]
-        transformed2 = transformed2 * weight.view(-1, 1, 1, 1)
-
-        pooled_out2 = transformed2.mean(dim=[2, 3])
-        logits2 = self.classifier(pooled_out2)               # classifier 不收梯度（FE 在 opt_exp 外）
-
-        # ── Hinge-margin 对抗（有界、有停止点）──
-        # 旧: loss_anti = -CE  无上界 → 专家要么跑飞(崩)要么投降(退化ERM)
-        # 新: 只要把"正确类概率"压到 margin 以下就停手(clamp→梯度为0)，
-        #     分类器一反弹专家立刻重新有活干 → 在 margin 附近稳定拉锯。
-        # margin=0.5: PACS 7类，随机≈0.14，0.5是"相当不确定"的强度。
-        margin = float(self.hparams.get("anti_margin", 0.5))
-        probs = F.softmax(logits2, dim=1)
-        prob_correct = probs.gather(1, all_y.unsqueeze(1)).squeeze(1)  # [B]
-        loss_anti = torch.clamp(prob_correct - margin, min=0.0).mean()
-
-        # 特征距离约束：专家输出不能偏离 content 太远
+        # ── 监控指标 ──
         with torch.no_grad():
-            c_mean = feat_detach.mean(dim=[2, 3], keepdim=True)
-            c_std = feat_detach.std(dim=[2, 3], keepdim=True) + 1e-5
-            content_ref = (feat_detach - c_mean) / c_std               # IN(feat)
-        loss_perturb = (transformed2 - content_ref).pow(2).mean()
-
-        # 负载均衡（仅监控，不回传梯度）
-        with torch.no_grad():
-            f_k = soft_weights.mean(dim=0) + 1e-8                # [K]
-            loss_balance = (f_k * f_k.log()).sum()
-
-        # Hinge 有上界，扰动约束可保留小系数防止专家输出漂太远
-        loss_exp = loss_anti + 0.1 * loss_perturb
-
-        self.opt_exp.zero_grad()
-        loss_exp.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.router.parameters()) + [p for e in self.experts for p in e.parameters()],
-            max_norm=1.0,
-        )
-        self.opt_exp.step()
-
-        self.sch_cls.step()
-        self.sch_exp.step()
+            prob_correct = F.softmax(logits, dim=1).gather(
+                1, all_y.unsqueeze(1)).squeeze(1).mean()
+            delta_norm = getattr(self.expert, "_last_delta_norm", 0.0)
 
         return {
             "loss_cls": loss_cls.item(),
-            "loss_anti": loss_anti.item(),
-            "loss_perturb": loss_perturb.item(),
             "loss_balance": loss_balance.item(),
-            "prob_correct": prob_correct.detach().mean().item(),
+            "prob_correct": prob_correct.item(),
+            "delta_norm": float(delta_norm),
         }
 
     def predict(self, x):
-        """推理：Router argmax → Expert 干预 → Classifier。"""
+        """
+        推理：对抗扰动是训练期正则，测试期用干净特征分类。
+        → 训练完就是一个鲁棒分类器，专家/路由器可丢弃。
+        """
         with torch.no_grad():
-            logits, _ = self._forward(x)
-            return logits
+            feat = self.backbone(x)
+            pooled = feat.mean(dim=[2, 3])
+            return self.classifier(pooled)

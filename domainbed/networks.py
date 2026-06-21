@@ -1423,3 +1423,98 @@ class StyleQueryExpert(nn.Module):
         out = self.norm(content_flat + attn_out)  # [B, H*W, C]
         out = out.transpose(1, 2).reshape(B, C, H, W)  # [B, C, H, W]
         return out
+
+
+class FourierStyleExpert(nn.Module):
+    """
+    ============================================================================
+    频域因子专家（无 min-max 版）
+    ============================================================================
+    设计动机：
+      旧版 StyleQueryExpert 用"学出来的网络"去逼近"分类器最难方向"，单/双
+      优化器下要么追不上分类器(投降)要么追过头(跑飞)。本版直接用 FGSM 单步
+      闭式求出当前分类器的最难扰动方向 g = sign(∇_|F| CE)，天然追得上、无博弈。
+
+    内容/风格分离（傅里叶分解，比 AdaIN 的 μσ 更适合 DG）：
+      F = FFT(feat) = |F| · e^{iφ}
+        相位谱 φ      → 内容（空间结构/形状轮廓），整个流程不动 φ
+        幅度谱 |F|    → 风格（纹理/频率能量分布），扰动只加在 |F| 上
+      频率轴 (u,v) 是跨域通用坐标系 → 训练域学到的扰动方向可迁移到 OOD（Photo）
+
+    因子专家结构：
+      K 个固定径向频率带 = K 个 style 因子专家（低频=颜色/光照，中频=粗纹理，
+      高频=细纹理）。Router 软选择各带扰动权重 w_k，实现"纹理强+对比弱 →
+      纹理带+对比带共同干预"的因子组合。
+
+    为何不用可学习方向基：单优化器 min-CE 会把缩放扰动的参数推向 0（坍缩），
+    与旧版专家投降同病。固定频率带无可学习扰动参数，彻底避开。带数 K 将来
+    由 Module 1 谱分析/中介分析给出理论依据，而非人设。
+    """
+
+    def __init__(self, feat_dim, n_bands=3, eps=0.1):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.n_bands = n_bands
+        self.eps = eps
+        # 频带 mask 延迟到首次 forward 时按实际 H,W 构建（适配任意输入尺寸）
+        self.register_buffer("band_masks", torch.empty(0))
+
+    def _build_radial_bands(self, K, S):
+        """径向频率带 mask: [K, S, S]，沿径向频率 [0,1] 等分为 K 段。"""
+        freqs = torch.fft.fftfreq(S)
+        fy, fx = torch.meshgrid(freqs, freqs, indexing="ij")
+        rad = torch.sqrt(fy ** 2 + fx ** 2)
+        rad = rad / rad.max().clamp(min=1e-8)
+        edges = torch.linspace(0.0, 1.0, K + 1)
+        masks = torch.zeros(K, S, S)
+        for k in range(K):
+            masks[k] = ((rad >= edges[k]) & (rad < edges[k + 1])).float()
+        # 末段闭合上界，避免最高频丢失
+        masks[-1] = ((rad >= edges[K - 1]) & (rad <= edges[K] + 1e-6)).float()
+        return masks
+
+    def forward(self, feat, router_weights, classifier, labels):
+        """
+        Args:
+            feat:           [B, C, H, W]  backbone 输出
+            router_weights:[B, K]  softmax 软选择权重（可微 → router 收梯度）
+            classifier:     用于 FGSM 内层求最难方向（不更新其参数）
+            labels:        [B]
+        Returns:
+            feat_pert:     [B, C, H, W]  扰动后特征（只动了幅度谱/风格）
+        """
+        B, C, H, W = feat.shape
+        K = self.n_bands
+
+        # 懒构建频带 mask
+        if self.band_masks.numel() == 0 or self.band_masks.shape[-1] != W:
+            self.band_masks = self._build_radial_bands(K, W).to(feat.device)
+
+        # ── FFT 分解 ──
+        Fc = torch.fft.fft2(feat)            # 复数 [B, C, H, W]
+        amp = Fc.abs()                        # 幅度谱（风格）
+        pha = Fc.angle()                      # 相位谱（内容）—— 不扰动
+
+        # ── FGSM 单步闭式求最难方向（detached, 不学习）──
+        amp_det = amp.detach().clone().requires_grad_(True)
+        recon = amp_det * torch.exp(1j * pha.detach())
+        feat_det = torch.fft.ifft2(recon).real
+        logits_det = classifier(feat_det.mean(dim=[2, 3]))
+        loss_det = F.cross_entropy(logits_det, labels)
+        g = torch.autograd.grad(loss_det, amp_det)[0].sign()   # [B, C, H, W]
+        g = g.detach()
+
+        # ── 各频带扰动，按 router 权重软组合（可微到 router）──
+        # delta[b,c,h,w] = eps * Σ_k w[b,k] * mask[k,h,w] * g[b,c,h,w]
+        delta = self.eps * torch.einsum(
+            "bk,khw,bchw->bchw", router_weights, self.band_masks, g
+        )
+
+        # ── 只扰动幅度谱（风格），相位谱（内容）保持原样 ──
+        amp_pert = amp + delta                              # amp 带 backbone 梯度, delta 带 router 梯度
+        complex_pert = amp_pert * torch.exp(1j * pha)       # pha 带 backbone 梯度（正常学习）
+        feat_pert = torch.fft.ifft2(complex_pert).real
+
+        # 记录扰动强度供日志
+        self._last_delta_norm = delta.detach().abs().mean().item()
+        return feat_pert
